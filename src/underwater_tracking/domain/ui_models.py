@@ -913,6 +913,24 @@ class ExecutionRegionView(StrictModel):
     task_group_id: str | None = None
     evidence_ids: tuple[str, ...] = Field(min_length=1)
     scan_telemetry: ScanTelemetryView | None = None
+    entry_probability: float | None = Field(default=None, ge=0, le=1)
+    entry_confirmations: int = Field(default=0, ge=0)
+    entry_confirmation_required: int = Field(default=2, ge=1)
+    entry_observation_cycle_s: int | None = Field(default=None, ge=0)
+    entry_reset_reason: Literal[
+        "missing_probability",
+        "non_finite_probability",
+        "below_threshold",
+        "simultaneous_exit",
+    ] | None = None
+    entry_evidence_ids: tuple[str, ...] = ()
+    coverage: float = Field(default=0.0, ge=0, le=1)
+    route_progress: float = Field(default=0.0, ge=0, le=1)
+    scan_round: int = Field(default=0, ge=0)
+    ping_count: int = Field(default=0, ge=0)
+    scan_completion_threshold: float = Field(default=0.95, gt=0, le=1)
+    scan_completed: bool = False
+    scan_evidence_ids: tuple[str, ...] = ()
 
     @model_validator(mode="before")
     @classmethod
@@ -975,6 +993,14 @@ class TrackingControlView(StrictModel):
     dedicated_release_triggered_at_m: float | None = Field(default=None, ge=0)
     dedicated_release_reason: str | None = None
     source_event_ids: tuple[str, ...] = ()
+    handoff_observation_cycle_s: int | None = Field(default=None, ge=0)
+    successor_required_uuv_ids: tuple[str, ...] = ()
+    successor_deployed_uuv_ids: tuple[str, ...] = ()
+    successor_healthy_uuv_ids: tuple[str, ...] = ()
+    successor_passive_uuv_ids: tuple[str, ...] = ()
+    successor_observing_uuv_ids: tuple[str, ...] = ()
+    successor_evidence_ids: tuple[str, ...] = ()
+    handoff_blocked_reason: str | None = None
 
 
 class RegionReplacementView(StrictModel):
@@ -987,6 +1013,25 @@ class RegionReplacementView(StrictModel):
     incoming_group_id: str = Field(min_length=1)
     latest_pending_geometry_revision: int | None = Field(default=None, ge=1)
     batch_id: str | None = None
+    outgoing_lifecycle: Literal[
+        "entering",
+        "active_scan",
+        "passive_track",
+        "dedicated_track",
+        "dedicated_release_pending",
+        "exiting",
+        "disappeared",
+    ]
+    incoming_lifecycle: Literal[
+        "entering",
+        "active_scan",
+        "passive_track",
+        "dedicated_track",
+        "dedicated_release_pending",
+        "exiting",
+        "disappeared",
+    ]
+    evidence_ids: tuple[str, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
     def validate_replacement(self) -> RegionReplacementView:
@@ -1153,20 +1198,16 @@ class ExecutionView(StrictModel):
                             "dedicated restore pair cannot contain a terminal incoming group"
                         )
                     continue
-                exiting = [
-                    group for group in region_groups if group.lifecycle == "exiting"
-                ]
+                slot_ids = {group.group_instance_id for group in region_groups}
                 incoming = [
-                    group for group in region_groups if group.lifecycle != "exiting"
+                    group
+                    for group in region_groups
+                    if group.source_group_instance_id in slot_ids
                 ]
-                if (
-                    len(exiting) != 1
-                    or len(incoming) != 1
-                    or incoming[0].lifecycle == "disappeared"
-                ):
+                if len(incoming) != 1 or incoming[0].lifecycle == "disappeared":
                     raise ValueError(
-                        "execution replacement pair requires one exiting outgoing "
-                        "and one current non-exiting incoming group"
+                        "execution replacement pair requires one source-linked "
+                        "current incoming group"
                     )
         group_regions = {group.region_id for group in self.task_groups}
         if self.tracking_control.mode == "regional" and group_regions != set(region_ids):
@@ -1182,12 +1223,20 @@ class ExecutionView(StrictModel):
                 for group in self.task_groups
                 if group.group_instance_id not in linked_group_ids
             )
+            replacement_source_ids = {
+                group.source_group_instance_id
+                for group in self.task_groups
+                if group.source_group_instance_id is not None
+            }
             if any(
                 group.lifecycle not in {"exiting", "disappeared"}
+                and group.group_instance_id not in replacement_source_ids
+                and group.source_group_instance_id not in linked_group_ids
                 for group in unlinked_groups
             ):
                 raise ValueError(
-                    "regional execution unlinked groups must be exiting or disappeared"
+                    "regional execution unlinked groups must be replacement peers "
+                    "or terminal"
                 )
         if self.tracking_control.mode == "dedicated":
             if len(self.task_groups) not in {1, 4, 5, 8}:

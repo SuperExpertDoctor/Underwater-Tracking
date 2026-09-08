@@ -8,6 +8,7 @@ from typing import Annotated, Literal
 from pydantic import ConfigDict, Field, model_validator
 
 from underwater_tracking.domain.execution_models import (
+    ExecutionRegion,
     ReserveUUVState,
     TaskGroupAssignment,
     TaskGroupInstance,
@@ -19,6 +20,12 @@ from underwater_tracking.domain.models import RuntimeEvent, StrictModel
 FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
 PositiveFloat = Annotated[float, Field(gt=0, allow_inf_nan=False)]
 UnitFloat = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
+EntryResetReason = Literal[
+    "missing_probability",
+    "non_finite_probability",
+    "below_threshold",
+    "simultaneous_exit",
+]
 
 
 class UUVMissionMode(str, Enum):
@@ -200,8 +207,19 @@ class RegionMissionState(StrictModel):
     passive_track_uuv_ids: tuple[str, ...] = ()
     reserve_uuv_ids: tuple[str, ...] = ()
     coverage: UnitFloat = 0.0
+    route_progress: UnitFloat = 0.0
+    scan_round: int = Field(default=0, ge=0)
+    ping_count: int = Field(default=0, ge=0)
+    scan_completion_threshold: float = Field(default=0.95, gt=0, le=1)
+    scan_completed: bool = False
+    scan_evidence_ids: tuple[str, ...] = ()
     tracking_quality: UnitFloat = 0.0
+    entry_probability: UnitFloat | None = None
     entry_confirmations: int = Field(default=0, ge=0)
+    entry_confirmation_required: int = Field(default=2, ge=1)
+    entry_observation_cycle_s: int | None = Field(default=None, ge=0)
+    entry_reset_reason: EntryResetReason | None = None
+    entry_evidence_ids: tuple[str, ...] = ()
     handoff_from: str | None = None
     handoff_to: str | None = None
     carrier_task_id: str | None = None
@@ -228,6 +246,16 @@ class RegionMissionState(StrictModel):
             for right in groups[index + 1 :]
         ):
             raise ValueError("region UUV assignments overlap")
+        if len(self.entry_evidence_ids) != len(set(self.entry_evidence_ids)):
+            raise ValueError("region entry evidence IDs must be unique")
+        if any(not evidence_id.strip() for evidence_id in self.entry_evidence_ids):
+            raise ValueError("region entry evidence IDs must not be empty")
+        if len(self.scan_evidence_ids) != len(set(self.scan_evidence_ids)):
+            raise ValueError("region scan evidence IDs must be unique")
+        if any(not evidence_id.strip() for evidence_id in self.scan_evidence_ids):
+            raise ValueError("region scan evidence IDs must not be empty")
+        if self.scan_completed != (self.coverage >= self.scan_completion_threshold):
+            raise ValueError("scan_completed must match the coverage threshold")
         return self
 
 
@@ -277,10 +305,11 @@ class HandoffEvidence(StrictModel):
         required = set(self.required_uuv_ids)
         passive = set(self.passive_mode_uuv_ids)
         for observation in self.accepted_observations:
-            if observation.observer_uuv_id not in required or observation.observer_uuv_id not in passive:
-                raise ValueError(
-                    "accepted observation observer must be a required passive UUV"
-                )
+            if (
+                observation.observer_uuv_id not in required
+                or observation.observer_uuv_id not in passive
+            ):
+                raise ValueError("accepted observation observer must be a required passive UUV")
             if observation.observed_at_s != self.observation_cycle_s:
                 raise ValueError("accepted observation cycle must match observation cycle")
         return self
@@ -290,9 +319,7 @@ class HandoffEvidence(StrictModel):
         if group_min_size < 1:
             raise ValueError("group_min_size must be positive")
         required = set(self.required_uuv_ids)
-        observers = {
-            observation.observer_uuv_id for observation in self.accepted_observations
-        }
+        observers = {observation.observer_uuv_id for observation in self.accepted_observations}
         return (
             self.blocked_reason is None
             and not self.hard_guard_reasons
@@ -302,6 +329,39 @@ class HandoffEvidence(StrictModel):
             and required.issubset(self.passive_mode_uuv_ids)
             and len(observers) >= group_min_size
         )
+
+
+class RegionReplacementState(StrictModel):
+    """Bounded per-slot state for one visible region replacement."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    region_id: str = Field(min_length=1)
+    source_geometry_revision: int = Field(ge=1)
+    target_geometry_revision: int = Field(ge=1)
+    outgoing_group_id: str = Field(min_length=1)
+    incoming_group_id: str = Field(min_length=1)
+    coalesce_pending_geometry: bool = False
+    latest_pending_region: ExecutionRegion | None = None
+    latest_pending_group: TaskGroupInstance | None = None
+
+    @model_validator(mode="after")
+    def validate_replacement(self) -> RegionReplacementState:
+        if self.outgoing_group_id == self.incoming_group_id:
+            raise ValueError("replacement outgoing and incoming groups must differ")
+        if self.target_geometry_revision <= self.source_geometry_revision:
+            raise ValueError("replacement target geometry revision must be newer")
+        if (
+            self.latest_pending_region is not None
+            and self.latest_pending_region.region_id != self.region_id
+        ):
+            raise ValueError("pending replacement region must use the same slot")
+        if (
+            self.latest_pending_group is not None
+            and self.latest_pending_group.region_id != self.region_id
+        ):
+            raise ValueError("pending replacement group must use the same slot")
+        return self
 
 
 class CarrierMissionModel(StrictModel):
@@ -324,10 +384,7 @@ class CarrierMissionModel(StrictModel):
         if self.stop_windows:
             if len(self.stop_windows) != len(self.stop_ids):
                 raise ValueError("carrier route stop windows must match stop IDs")
-            if any(
-                entry_s < 0 or exit_s <= entry_s
-                for entry_s, exit_s in self.stop_windows
-            ):
+            if any(entry_s < 0 or exit_s <= entry_s for entry_s, exit_s in self.stop_windows):
                 raise ValueError("carrier route stop windows must be ordered")
         if self.stop_indices:
             if len(self.stop_indices) != len(self.stop_ids):
@@ -336,10 +393,7 @@ class CarrierMissionModel(StrictModel):
                 raise ValueError("carrier route stop indices require route points")
             if len(self.stop_indices) != len(set(self.stop_indices)):
                 raise ValueError("carrier route stop indices must be unique")
-            if any(
-                index <= 0 or index >= len(self.route_xy) - 1
-                for index in self.stop_indices
-            ):
+            if any(index <= 0 or index >= len(self.route_xy) - 1 for index in self.stop_indices):
                 raise ValueError("carrier route stop index must identify an interior route point")
         groups = (
             self.onboard_uuv_ids,
@@ -427,9 +481,7 @@ class ExecutableMissionPlan(StrictModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     revision: int = Field(ge=1)
-    uuv_batches_by_carrier: dict[str, tuple[UUVMissionBatch, ...]] = Field(
-        default_factory=dict
-    )
+    uuv_batches_by_carrier: dict[str, tuple[UUVMissionBatch, ...]] = Field(default_factory=dict)
     reserved_uuv_ids: tuple[str, ...] = ()
     region_assignments: tuple[RegionMissionState, ...] = ()
     carrier_missions: dict[str, CarrierMissionModel] = Field(default_factory=dict)
@@ -458,9 +510,7 @@ class ExecutableMissionPlan(StrictModel):
         if overlap:
             raise ValueError(f"UUV is both deployed and reserved: {sorted(overlap)}")
         task_group_members = tuple(
-            member
-            for group in self.task_groups
-            for member in group.member_uuv_ids
+            member for group in self.task_groups for member in group.member_uuv_ids
         )
         if len(task_group_members) != len(set(task_group_members)):
             raise ValueError("UUV appears in multiple execution task groups")
@@ -507,9 +557,7 @@ class ExecutableMissionPlan(StrictModel):
             }
             overlap = assignment_ids.intersection(assigned)
             if overlap:
-                raise ValueError(
-                    f"UUV appears in multiple region assignments: {sorted(overlap)}"
-                )
+                raise ValueError(f"UUV appears in multiple region assignments: {sorted(overlap)}")
             assignment_ids.update(assigned)
         return self
 
@@ -570,6 +618,7 @@ class MissionSnapshot(StrictModel):
     task_groups: tuple[TaskGroupInstance, ...] = ()
     tracking_control: TrackingControlState = Field(default_factory=TrackingControlState)
     pending_region_revisions: Mapping[str, int] = Field(default_factory=dict)
+    replacement_states: tuple[RegionReplacementState, ...] = ()
     uuv_modes: Mapping[str, UUVMissionMode] = Field(default_factory=dict)
     uuv_resources: Mapping[str, UUVResourceState] = Field(default_factory=dict)
     resource_episode_by_uuv: Mapping[str, int] = Field(default_factory=dict)
@@ -581,13 +630,16 @@ class MissionSnapshot(StrictModel):
     def validate_runtime_projection(self) -> MissionSnapshot:
         if any(revision < 0 for revision in self.pending_region_revisions.values()):
             raise ValueError("pending region revisions must be non-negative")
+        replacement_region_ids = tuple(
+            replacement.region_id for replacement in self.replacement_states
+        )
+        if len(replacement_region_ids) != len(set(replacement_region_ids)):
+            raise ValueError("replacement states must be unique by region")
         _validate_runtime_task_groups(
             self.task_groups,
             self.tracking_control,
             region_ids=(
-                tuple(region.region_id for region in self.regions)
-                if self.regions
-                else None
+                tuple(region.region_id for region in self.regions) if self.regions else None
             ),
             region_topology={
                 region.region_id: (region.handoff_from, region.handoff_to)
@@ -598,16 +650,36 @@ class MissionSnapshot(StrictModel):
 
 
 _REGION_TRANSITIONS: dict[RegionLifecycle, frozenset[RegionLifecycle]] = {
-    RegionLifecycle.PLANNED: frozenset({RegionLifecycle.CARRIER_DEPLOYING, RegionLifecycle.DEGRADED}),
-    RegionLifecycle.CARRIER_DEPLOYING: frozenset({RegionLifecycle.ACTIVE_SCAN, RegionLifecycle.DEGRADED}),
-    RegionLifecycle.ACTIVE_SCAN: frozenset({RegionLifecycle.PASSIVE_TRACK, RegionLifecycle.DEGRADED, RegionLifecycle.UNCOVERED}),
-    RegionLifecycle.PASSIVE_TRACK: frozenset({RegionLifecycle.HANDOFF_PENDING, RegionLifecycle.TRACKING_COMPLETED, RegionLifecycle.DEGRADED}),
-    RegionLifecycle.HANDOFF_PENDING: frozenset({RegionLifecycle.TRACKING_COMPLETED, RegionLifecycle.DEGRADED}),
+    RegionLifecycle.PLANNED: frozenset(
+        {RegionLifecycle.CARRIER_DEPLOYING, RegionLifecycle.DEGRADED}
+    ),
+    RegionLifecycle.CARRIER_DEPLOYING: frozenset(
+        {RegionLifecycle.ACTIVE_SCAN, RegionLifecycle.DEGRADED}
+    ),
+    RegionLifecycle.ACTIVE_SCAN: frozenset(
+        {RegionLifecycle.PASSIVE_TRACK, RegionLifecycle.DEGRADED, RegionLifecycle.UNCOVERED}
+    ),
+    RegionLifecycle.PASSIVE_TRACK: frozenset(
+        {
+            RegionLifecycle.HANDOFF_PENDING,
+            RegionLifecycle.TRACKING_COMPLETED,
+            RegionLifecycle.DEGRADED,
+        }
+    ),
+    RegionLifecycle.HANDOFF_PENDING: frozenset(
+        {RegionLifecycle.TRACKING_COMPLETED, RegionLifecycle.DEGRADED}
+    ),
     RegionLifecycle.TRACKING_COMPLETED: frozenset({RegionLifecycle.CARRIER_RECOVERY}),
-    RegionLifecycle.CARRIER_RECOVERY: frozenset({RegionLifecycle.RECOVERED, RegionLifecycle.DEGRADED}),
+    RegionLifecycle.CARRIER_RECOVERY: frozenset(
+        {RegionLifecycle.RECOVERED, RegionLifecycle.DEGRADED}
+    ),
     RegionLifecycle.RECOVERED: frozenset(),
-    RegionLifecycle.DEGRADED: frozenset({RegionLifecycle.CARRIER_DEPLOYING, RegionLifecycle.RECOVERED}),
-    RegionLifecycle.UNCOVERED: frozenset({RegionLifecycle.CARRIER_DEPLOYING, RegionLifecycle.DEGRADED}),
+    RegionLifecycle.DEGRADED: frozenset(
+        {RegionLifecycle.CARRIER_DEPLOYING, RegionLifecycle.RECOVERED}
+    ),
+    RegionLifecycle.UNCOVERED: frozenset(
+        {RegionLifecycle.CARRIER_DEPLOYING, RegionLifecycle.DEGRADED}
+    ),
 }
 
 

@@ -6,7 +6,7 @@ from hashlib import sha256
 import pytest
 from pydantic import ValidationError
 
-from underwater_tracking.api.frame_builder import operational_frame_json
+from underwater_tracking.api.frame_builder import build_uuv_only_frame, operational_frame_json
 from underwater_tracking.api.frame_logger import FrameLogger
 from underwater_tracking.api.hub import OperationalHub
 from underwater_tracking.api.replay import ReplayService
@@ -16,6 +16,11 @@ from underwater_tracking.domain.execution_models import (
     TaskGroupInstance,
     TaskGroupLifecycle,
     TrackingControlState,
+)
+from underwater_tracking.domain.mission_models import (
+    MissionSnapshot,
+    RegionLifecycle,
+    RegionMissionState,
 )
 from tests.domain.test_execution_models import _snapshot as execution_snapshot
 from underwater_tracking.api.frame_builder import (
@@ -46,19 +51,15 @@ def _parallel_replacement_snapshot():
         region_id = f"target_00:task:{slot:02d}"
         outgoing_id = f"S1:{region_id}:deploy:000008:outgoing"
         incoming_id = f"S1:{region_id}:deploy:000009:incoming"
-        outgoing_members = tuple(
-            f"uuv_{(slot - 1) * 6 + member:02d}" for member in range(3)
-        )
-        incoming_members = tuple(
-            f"uuv_{(slot - 1) * 6 + 3 + member:02d}" for member in range(3)
-        )
+        outgoing_members = tuple(f"uuv_{(slot - 1) * 6 + member:02d}" for member in range(3))
+        incoming_members = tuple(f"uuv_{(slot - 1) * 6 + 3 + member:02d}" for member in range(3))
         outgoing = TaskGroupInstance(
             group_instance_id=outgoing_id,
             target_id="target_00",
             region_id=region_id,
             deployment_revision=8,
             member_uuv_ids=outgoing_members,
-            lifecycle=TaskGroupLifecycle.EXITING,
+            lifecycle=TaskGroupLifecycle.PASSIVE_TRACK,
             sensor_mode=GroupSensorMode.PASSIVE,
             ownership_status="candidate",
             reason="region_replacement",
@@ -96,9 +97,7 @@ def _parallel_replacement_snapshot():
                     )
                 )
     regions = tuple(
-        region.model_copy(
-            update={"task_group_id": groups[index * 2 + 1].group_instance_id}
-        )
+        region.model_copy(update={"task_group_id": groups[index * 2].group_instance_id})
         for index, region in enumerate(base.regions)
     )
     return base.model_copy(
@@ -129,13 +128,9 @@ def _runtime_execution_snapshot():
             target_id="target_00",
             region_id=f"target_00:task:{index:02d}",
             deployment_revision=9,
-            member_uuv_ids=tuple(
-                f"uuv_{(index - 1) * 3 + member:02d}" for member in range(3)
-            ),
+            member_uuv_ids=tuple(f"uuv_{(index - 1) * 3 + member:02d}" for member in range(3)),
             lifecycle=(
-                TaskGroupLifecycle.ACTIVE_SCAN
-                if index == 1
-                else TaskGroupLifecycle.ENTERING
+                TaskGroupLifecycle.ACTIVE_SCAN if index == 1 else TaskGroupLifecycle.ENTERING
             ),
             sensor_mode=GroupSensorMode.ACTIVE,
             ownership_status="candidate",
@@ -220,7 +215,9 @@ def test_execution_frame_projects_one_authoritative_four_region_snapshot() -> No
         "target_00:task:03",
         "target_00:task:04",
     )
-    assert frame.execution.regions[0].task_group_id == frame.execution.task_groups[0].group_instance_id
+    assert (
+        frame.execution.regions[0].task_group_id == frame.execution.task_groups[0].group_instance_id
+    )
     assert all(len(group.member_uuv_ids) == 3 for group in frame.execution.task_groups)
     assert not hasattr(frame.execution, "reserve_uuv_ids")
     assert frame.execution.degraded is False
@@ -292,14 +289,128 @@ def test_frame_projects_real_tracking_policy_and_all_visible_groups() -> None:
     assert len(frame.execution.task_groups) == 8
     assert len([uuv for uuv in frame.uuvs if uuv.physically_exposed]) == 24
     assert all(len(group.member_uuv_ids) == 3 for group in frame.execution.task_groups)
+    assert all(
+        region.task_group_id == replacement.outgoing_group_id
+        for region, replacement in zip(
+            frame.execution.regions,
+            frame.execution.replacements,
+            strict=True,
+        )
+    )
     assert {group.group_instance_id for group in frame.execution.task_groups} == {
         uuv.group_instance_id for uuv in frame.uuvs
     }
+    assert len(frame.execution.replacements) == 4
+    assert all(
+        replacement.outgoing_lifecycle == "passive_track"
+        and replacement.incoming_lifecycle == "active_scan"
+        and len(replacement.evidence_ids) == 2
+        for replacement in frame.execution.replacements
+    )
     payload = operational_frame_payload(frame)
     serialized = json.dumps(payload)
     assert "active_verifier_uuv_id" not in serialized
     assert "passive_tracker_uuv_id" not in serialized
     assert "reserve_uuv_ids" not in payload["execution"]
+
+
+def test_execution_frame_projects_authoritative_runtime_control_fields() -> None:
+    execution = _runtime_execution_snapshot()
+    owner = execution.task_groups[0].model_copy(
+        update={
+            "lifecycle": TaskGroupLifecycle.PASSIVE_TRACK,
+            "sensor_mode": GroupSensorMode.PASSIVE,
+            "ownership_status": "owner",
+        }
+    )
+    execution = execution.model_copy(update={"task_groups": (owner, *execution.task_groups[1:])})
+    first_group = execution.task_groups[0]
+    tracking_control = TrackingControlState(
+        mode="regional",
+        tracking_owner_group_id=first_group.group_instance_id,
+        pending_successor_group_id=execution.task_groups[1].group_instance_id,
+        handoff_observation_cycle_s=120,
+        successor_required_uuv_ids=execution.task_groups[1].member_uuv_ids,
+        successor_deployed_uuv_ids=execution.task_groups[1].member_uuv_ids,
+        successor_healthy_uuv_ids=execution.task_groups[1].member_uuv_ids,
+        successor_passive_uuv_ids=execution.task_groups[1].member_uuv_ids,
+        successor_observing_uuv_ids=execution.task_groups[1].member_uuv_ids[:2],
+        successor_evidence_ids=("bearing-01", "bearing-02"),
+        handoff_blocked_reason="successor_current_cycle_observations_incomplete",
+    )
+    mission = MissionSnapshot(
+        scenario_id=execution.scenario_id,
+        sim_time_s=120,
+        plan_revision=execution.execution_revision,
+        regions=tuple(
+            RegionMissionState(
+                region_id=region.region_id,
+                target_id=region.target_id,
+                task_group_id=region.task_group_id,
+                lifecycle=(
+                    RegionLifecycle.PASSIVE_TRACK if index == 0 else RegionLifecycle.ACTIVE_SCAN
+                ),
+                coverage=0.42 if index == 0 else 0.0,
+                route_progress=0.75 if index == 0 else 0.0,
+                scan_round=2 if index == 0 else 0,
+                ping_count=7 if index == 0 else 0,
+                scan_completed=False,
+                scan_evidence_ids=("ping-07",) if index == 0 else (),
+                entry_probability=0.73 if index == 0 else None,
+                entry_confirmations=2 if index == 0 else 0,
+                entry_confirmation_required=2,
+                entry_reset_reason=None,
+                entry_evidence_ids=("estimate-12",) if index == 0 else (),
+                plan_revision=execution.execution_revision,
+            )
+            for index, region in enumerate(execution.regions)
+        ),
+        task_groups=execution.task_groups,
+        tracking_control=tracking_control,
+        pending_region_revisions={execution.regions[0].region_id: 11},
+    )
+    situation = SituationSnapshot(
+        scenario_id=execution.scenario_id,
+        snapshot_revision=execution.source_snapshot_revision,
+        sim_time_s=120,
+        uuvs=(),
+        group_reports=(),
+        pending_events=(),
+    )
+
+    frame = build_operational_frame(
+        situation,
+        plan=None,
+        ledger_tail=(),
+        events=(),
+        metrics=(),
+        uuv_only=True,
+        mission_snapshot=mission,
+        execution_snapshot=execution.model_copy(update={"tracking_control": tracking_control}),
+    )
+
+    assert frame.execution is not None
+    region = frame.execution.regions[0]
+    assert region.coverage == 0.42
+    assert region.route_progress == 0.75
+    assert region.scan_round == 2
+    assert region.ping_count == 7
+    assert region.scan_completed is False
+    assert region.scan_evidence_ids == ("ping-07",)
+    assert region.entry_probability == 0.73
+    assert region.entry_confirmations == 2
+    assert region.entry_confirmation_required == 2
+    assert region.entry_reset_reason is None
+    assert region.entry_evidence_ids == ("estimate-12",)
+    assert frame.regional_missions[0].coverage == 0.42
+    assert (
+        frame.execution.tracking_control.successor_observing_uuv_ids
+        == (execution.task_groups[1].member_uuv_ids[:2])
+    )
+    assert (
+        frame.execution.tracking_control.handoff_blocked_reason
+        == "successor_current_cycle_observations_incomplete"
+    )
 
 
 def test_execution_view_rejects_three_groups_in_one_region() -> None:
@@ -343,16 +454,22 @@ def test_execution_frame_transport_serializers_have_one_canonical_payload(tmp_pa
     replayed = ReplayService(path).last()
     assert replayed is not None
 
-    assert sha256(
-        json.dumps(websocket_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest() == expected
-    assert sha256(
-        json.dumps(
-            json.loads(operational_frame_json(replayed)),
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest() == expected
+    assert (
+        sha256(
+            json.dumps(websocket_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        == expected
+    )
+    assert (
+        sha256(
+            json.dumps(
+                json.loads(operational_frame_json(replayed)),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        == expected
+    )
 
 
 def test_execution_frame_rejects_mixed_revision_and_candidate_grid_surface() -> None:
@@ -383,9 +500,7 @@ def test_hub_and_replay_use_the_same_execution_frame_payload(tmp_path) -> None:
 
 
 def test_legacy_frame_without_execution_remains_readable() -> None:
-    frame = _frame().model_copy(
-        update={"execution": None, "execution_consistency": None}
-    )
+    frame = _frame().model_copy(update={"execution": None, "execution_consistency": None})
 
     restored = type(frame).model_validate_json(frame.model_dump_json())
 
@@ -438,6 +553,40 @@ def test_live_publisher_reads_the_runtime_execution_snapshot() -> None:
     assert frame.uuv_only is True
     assert frame.execution is not None
     assert frame.execution.execution_revision == snapshot.execution_revision
+
+
+def test_direct_uuv_frame_uses_one_mission_snapshot_for_both_region_views() -> None:
+    execution = _runtime_execution_snapshot()
+    first_region = execution.regions[0]
+    mission = MissionSnapshot(
+        scenario_id=execution.scenario_id,
+        sim_time_s=int(execution.source_sim_time_s),
+        plan_revision=execution.execution_revision,
+        regions=tuple(
+            RegionMissionState(
+                region_id=region.region_id,
+                target_id=region.target_id,
+                task_group_id=region.task_group_id,
+                lifecycle=RegionLifecycle.ACTIVE_SCAN,
+                coverage=0.42 if region.region_id == first_region.region_id else 0.0,
+                tracking_quality=0.73 if region.region_id == first_region.region_id else 0.0,
+                plan_revision=execution.execution_revision,
+            )
+            for region in execution.regions
+        ),
+        task_groups=execution.task_groups,
+        tracking_control=execution.tracking_control,
+    )
+
+    frame = build_uuv_only_frame(
+        snapshot=mission,
+        execution_snapshot=execution,
+    )
+
+    assert frame.execution is not None
+    assert frame.execution.regions[0].coverage == 0.42
+    assert frame.regional_missions[0].coverage == 0.42
+    assert frame.regional_missions[0].tracking_quality == 0.73
 
 
 def test_live_publisher_drops_stale_accepted_prediction_during_execution_rollover() -> None:
@@ -585,6 +734,4 @@ def test_live_publisher_bounds_operator_thinking_event_references() -> None:
     ).publish(situation)
 
     assert len(frame.llm_thinking_source_event_ids) == 32
-    assert frame.llm_thinking_source_event_ids == tuple(
-        event.event_id for event in events[-32:]
-    )
+    assert frame.llm_thinking_source_event_ids == tuple(event.event_id for event in events[-32:])

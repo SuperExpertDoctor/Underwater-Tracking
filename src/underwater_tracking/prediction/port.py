@@ -209,7 +209,11 @@ def make_snapshot_predictor(
                         imm_candidate=imm_candidate,
                         bspline_candidate=candidate,
                     )
-                if estimate_health is not None and estimate_health.status == "degraded":
+                if (
+                    estimate_health is not None
+                    and estimate_health.status == "degraded"
+                    and regime != "imm"
+                ):
                     upstream_reasons.append("estimate_extrapolated")
                 accepted_status = "valid" if regime == "imm" and not upstream_reasons else "degraded"
                 return AcceptedPrediction(

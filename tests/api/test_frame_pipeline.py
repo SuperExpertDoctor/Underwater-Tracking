@@ -540,6 +540,27 @@ def test_live_builder_never_uses_legacy_unknown_prediction_health() -> None:
     ) == prediction.points_xy
 
 
+def test_unavailable_belief_does_not_publish_zero_track_revision() -> None:
+    report = _report("T1", "G1", (0.0, 0.0), ((100.0, 0.0), (0.0, 100.0)))
+    report = report.model_copy(
+        update={"belief": report.belief.model_copy(update={"track_revision": 0})}
+    )
+
+    frame = build_operational_frame(
+        _snapshot(reports=(report,)),
+        None,
+        (),
+        (),
+        (),
+    )
+
+    freshness = frame.target_estimates[0].estimate_freshness
+    assert freshness is not None
+    assert freshness.status == "unavailable"
+    assert freshness.track_revision is None
+    assert frame.target_estimates[0].track_revision is None
+
+
 def test_live_authoritative_builder_omits_unassessed_raw_prediction() -> None:
     report = _report("T1", "G1", (0.0, 0.0), ((100.0, 0.0), (0.0, 100.0)))
     raw_prediction = PredictedTrackRef(

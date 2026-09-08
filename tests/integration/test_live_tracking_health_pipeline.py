@@ -124,8 +124,15 @@ class LiveTrackingHarness:
     def frames_at(self, checkpoints: tuple[int, ...]) -> Iterator[tuple[int, object]]:
         for checkpoint in checkpoints:
             while self.engine._clock.sim_time_s < checkpoint:
+                self.loop.raise_if_llm_failed()
+                self.loop.apply_background_cycle()
                 self.engine.step()
+                # Production performs this projection before every telemetry
+                # publish. Keep the control path identical while limiting the
+                # large JSONL write to the acceptance checkpoints below.
+                self.loop._sync_runtime_execution_projection()
             assert self.engine._clock.sim_time_s == checkpoint
+            assert self.loop.drain_background_cycle(timeout_s=30.0)
             self.loop.publish_latest()
             frame = self.loop.hub.snapshot()
             if frame is None:
@@ -195,15 +202,23 @@ def _assert_frame_health_and_geometry(
                 hard_stale_s=900.0,
             )
     assert len(execution.regions) == 4
-    assert len(execution.task_groups) == 4
-    assert all(len(group.member_uuv_ids) == 3 for group in execution.task_groups)
-    assert len(
-        {
-            uuv_id
+    assert 4 <= len(execution.task_groups) <= 8
+    group_counts_by_region = {
+        region.region_id: sum(
+            group.region_id == region.region_id
             for group in execution.task_groups
-            for uuv_id in group.member_uuv_ids
-        }
-    ) == 12
+        )
+        for region in execution.regions
+    }
+    assert set(group_counts_by_region.values()).issubset({1, 2})
+    assert all(len(group.member_uuv_ids) == 3 for group in execution.task_groups)
+    member_uuv_ids = tuple(
+        uuv_id
+        for group in execution.task_groups
+        for uuv_id in group.member_uuv_ids
+    )
+    assert len(set(member_uuv_ids)) == len(member_uuv_ids)
+    assert len(member_uuv_ids) <= 24
     estimate = next(item for item in frame.target_estimates if item.target_id == "target_00")
     prediction = estimate.prediction
     # Long-running publication must fail closed, not keep a stale line alive.
@@ -305,6 +320,24 @@ def test_tracking_pipeline_remains_bounded_and_executable_for_eight_hours(
                 executable_at_frame=executable,
                 current_execution_at_frame=current_execution,
             )
+    finally:
+        harness.close()
+
+
+def test_runtime_projection_rolls_forward_after_replacement_geometry_changes(
+    tmp_path: Path,
+) -> None:
+    harness = LiveTrackingHarness(tmp_path, seed=20260828)
+    try:
+        tuple(harness.frames_at((1_410,)))
+
+        assert harness.loop.carrier_error_count == 0, harness.loop.carrier_error_details
+        current = harness.loop._execution_coordinator.current
+        assert current is not None
+        region = next(
+            item for item in current.regions if item.region_id == "target_00:task:03"
+        )
+        assert region.geometry_revision > 1
     finally:
         harness.close()
 
@@ -1000,7 +1033,10 @@ def test_uuv_only_agent_loop_publishes_authoritative_public_frame(
         assert estimate.prediction is not None
         assert estimate.prediction.health.status == "degraded"
         assert estimate.prediction.health.reason_codes
-        assert estimate.prediction.health.regime == "short_history"
+        assert estimate.prediction.health.regime in {
+            "short_history",
+            "boundary_recovery",
+        }
         assert estimate.estimate_health["status"] in {"current", "degraded"}
         assert estimate.quality.quality_score is not None
         assert frame.execution_consistency is not None

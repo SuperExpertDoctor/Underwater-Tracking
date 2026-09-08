@@ -91,9 +91,15 @@ def test_real_uuv_default_timeline_local_perception_and_periodic_memory(
     boundary_exits = [
         event for event in events if event.event_type == "uuv_boundary_exited"
     ]
-    assert len({event.entity_id for event in boundary_entries}) == 12
-    assert boundary_exits == []
-    assert "uuv_boundary_exit_started" not in event_types
+    boundary_entry_ids = {event.entity_id for event in boundary_entries}
+    boundary_exit_ids = {event.entity_id for event in boundary_exits}
+    assert {f"uuv_{index:02d}" for index in range(12)} <= boundary_entry_ids
+    assert len(boundary_entry_ids) > 12
+    assert boundary_exit_ids
+    assert boundary_exit_ids <= boundary_entry_ids
+    assert "uuv_boundary_exit_started" in event_types
+    assert "region_replacement_completed" in event_types
+    assert "task_group_disappeared" in event_types
     assert not any(
         event.event_type
         in {
@@ -121,9 +127,21 @@ def test_real_uuv_default_timeline_local_perception_and_periodic_memory(
         for frame in frames
     }
     assert all(
-        visible_ids <= {event.entity_id for event in boundary_entries}
+        visible_ids <= boundary_entry_ids
         for visible_ids in waterborne_by_time.values()
     )
+    assert max(map(len, waterborne_by_time.values())) <= 24
+    assert max(len(frame["execution_groups"]) for frame in frames) <= 8
+    assert max(
+        len(
+            {
+                member_id
+                for group in frame["execution_groups"]
+                for member_id in group["member_ids"]
+            }
+        )
+        for frame in frames
+    ) <= 24
 
     mission = engine.mission_snapshot()
     assert mission is not None
@@ -138,8 +156,14 @@ def test_real_uuv_default_timeline_local_perception_and_periodic_memory(
         )
     }
     assert len(assigned_ids) == 12
-    assert all(len(region.active_scan_uuv_ids) == 3 for region in mission.regions)
-    assert all(len(region.passive_track_uuv_ids) == 0 for region in mission.regions)
+    assert all(
+        len(region.active_scan_uuv_ids) + len(region.passive_track_uuv_ids) == 3
+        for region in mission.regions
+    )
+    assert all(
+        set(region.active_scan_uuv_ids).isdisjoint(region.passive_track_uuv_ids)
+        for region in mission.regions
+    )
     assert all(len(region.reserve_uuv_ids) == 0 for region in mission.regions)
 
     timeline_trace = run_uuv_only_acceptance(20260820)

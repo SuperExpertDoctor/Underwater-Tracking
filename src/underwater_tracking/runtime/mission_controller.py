@@ -13,6 +13,7 @@ from underwater_tracking.domain.mission_models import (
     ExecutableMissionPlan,
     HandoffEvidence,
     MissionSnapshot,
+    RegionReplacementState,
     RegionLifecycle,
     RegionMissionState,
     UUVMissionMode,
@@ -23,6 +24,7 @@ from underwater_tracking.domain.execution_models import (
     ExecutionRegion,
     GroupSensorMode,
     OperationalExecutionSnapshot,
+    TaskGroupAssignment,
     TaskGroupInstance,
     TaskGroupLifecycle,
     TrackingControlState,
@@ -34,7 +36,9 @@ from underwater_tracking.planning.coverage import (
     serpentine_coverage_waypoints_by_uuv,
 )
 from underwater_tracking.runtime.execution_health import classify_execution_health
-from underwater_tracking.runtime.task_group_instances import RegionReplacementState
+from underwater_tracking.runtime.task_group_instances import (
+    deployment_member_uuv_ids,
+)
 
 
 Observation = Mapping[str, object]
@@ -116,12 +120,9 @@ def _region_plan_assignments_match(
     assignments_match = (
         current.region_id == candidate.region_id
         and current.target_id == candidate.target_id
-        and frozenset(current.active_scan_uuv_ids)
-        == frozenset(candidate.active_scan_uuv_ids)
-        and frozenset(current.passive_track_uuv_ids)
-        == frozenset(candidate.passive_track_uuv_ids)
-        and frozenset(current.reserve_uuv_ids)
-        == frozenset(candidate.reserve_uuv_ids)
+        and frozenset(current.active_scan_uuv_ids) == frozenset(candidate.active_scan_uuv_ids)
+        and frozenset(current.passive_track_uuv_ids) == frozenset(candidate.passive_track_uuv_ids)
+        and frozenset(current.reserve_uuv_ids) == frozenset(candidate.reserve_uuv_ids)
     )
     if not assignments_match:
         return False
@@ -146,10 +147,41 @@ def _preserve_region_progress(
     current_rank = _REGION_PROGRESS_ORDER[current.lifecycle]
     if candidate_rank is None or current_rank < candidate_rank:
         return candidate
+    coverage = max(current.coverage, candidate.coverage)
+    scan_round = max(current.scan_round, candidate.scan_round)
+    if current.scan_round > candidate.scan_round:
+        route_progress = current.route_progress
+    elif candidate.scan_round > current.scan_round:
+        route_progress = candidate.route_progress
+    else:
+        route_progress = max(current.route_progress, candidate.route_progress)
+    current_entry_is_newer = current.entry_observation_cycle_s is not None and (
+        candidate.entry_observation_cycle_s is None
+        or current.entry_observation_cycle_s >= candidate.entry_observation_cycle_s
+    )
+    entry_updates: dict[str, object] = {}
+    if current_entry_is_newer:
+        entry_updates = {
+            "entry_probability": current.entry_probability,
+            "entry_confirmations": max(
+                current.entry_confirmations,
+                candidate.entry_confirmations,
+            ),
+            "entry_observation_cycle_s": current.entry_observation_cycle_s,
+            "entry_reset_reason": current.entry_reset_reason,
+            "entry_evidence_ids": current.entry_evidence_ids,
+        }
     return candidate.model_copy(
         update={
             "lifecycle": current.lifecycle,
-            "coverage": max(current.coverage, candidate.coverage),
+            "coverage": coverage,
+            "route_progress": route_progress,
+            "scan_round": scan_round,
+            "ping_count": max(current.ping_count, candidate.ping_count),
+            "scan_completed": (coverage >= candidate.scan_completion_threshold),
+            "scan_evidence_ids": tuple(
+                dict.fromkeys((*candidate.scan_evidence_ids, *current.scan_evidence_ids))
+            ),
             "tracking_quality": max(
                 current.tracking_quality,
                 candidate.tracking_quality,
@@ -159,18 +191,57 @@ def _preserve_region_progress(
                 candidate.entry_confirmations,
             ),
             "degraded_reasons": tuple(
-                dict.fromkeys(
-                    (*candidate.degraded_reasons, *current.degraded_reasons)
-                )
+                dict.fromkeys((*candidate.degraded_reasons, *current.degraded_reasons))
             ),
+            **entry_updates,
         }
     )
+
+
+def _runtime_routes_are_usable(
+    routes: Mapping[str, tuple[tuple[float, float], ...]],
+    member_ids: Sequence[str],
+) -> bool:
+    """Return whether every active member has an independent route start."""
+
+    if not member_ids or set(routes) != set(member_ids):
+        return False
+    first_points = [routes[member_id][0] for member_id in member_ids if routes[member_id]]
+    return len(first_points) == len(member_ids) and len(set(first_points)) == len(first_points)
+
+
+def _rekey_runtime_routes_by_member_slot(
+    routes: Mapping[str, tuple[tuple[float, float], ...]],
+    member_ids: Sequence[str],
+) -> dict[str, tuple[tuple[float, float], ...]] | None:
+    """Rekey a route map when a refresh changes only the group generation ID."""
+
+    source_by_slot: dict[str, str] = {}
+    target_by_slot: dict[str, str] = {}
+    for route_id in routes:
+        _, separator, slot = route_id.rpartition(":member:")
+        if not separator or slot in source_by_slot:
+            return None
+        source_by_slot[slot] = route_id
+    for member_id in member_ids:
+        _, separator, slot = member_id.rpartition(":member:")
+        if not separator or slot in target_by_slot:
+            return None
+        target_by_slot[slot] = member_id
+    if set(source_by_slot) != set(target_by_slot):
+        return None
+    candidate = {
+        target_by_slot[slot]: deepcopy(routes[source_by_slot[slot]])
+        for slot in sorted(target_by_slot)
+    }
+    return candidate if _runtime_routes_are_usable(candidate, member_ids) else None
 
 
 def execution_snapshot_to_mission_plan(
     snapshot: OperationalExecutionSnapshot,
     *,
     current_region_lifecycles: Mapping[str, RegionLifecycle] | None = None,
+    current_resource_episodes: Mapping[str, int] | None = None,
     detection_radius_m: float = 600.0,
 ) -> ExecutableMissionPlan:
     """Project one authoritative execution snapshot into controller state.
@@ -185,7 +256,10 @@ def execution_snapshot_to_mission_plan(
         group for group in snapshot.task_groups if isinstance(group, TaskGroupInstance)
     )
 
-    groups_by_region: dict[str, tuple[object, ...]] = {}
+    groups_by_region: dict[
+        str,
+        tuple[TaskGroupAssignment | TaskGroupInstance, ...],
+    ] = {}
     for group in snapshot.task_groups:
         groups_by_region.setdefault(group.region_id, ())
         groups_by_region[group.region_id] = (
@@ -204,24 +278,30 @@ def execution_snapshot_to_mission_plan(
         "uncovered": RegionLifecycle.UNCOVERED,
     }
     assignments: list[RegionMissionState] = []
-    resource_episodes: dict[str, int] = {}
+    resource_episodes = {
+        uuv_id: (current_resource_episodes or {}).get(uuv_id, 0)
+        for task_group in snapshot.task_groups
+        for uuv_id in task_group.member_uuv_ids
+    }
     for region in snapshot.regions:
         region_groups = groups_by_region.get(region.region_id, ())
         if not region_groups:
             raise ValueError(f"execution snapshot has no task group for {region.region_id}")
         if runtime_groups:
-            group = _select_runtime_group(
+            runtime_group = _select_runtime_group(
                 region_groups,
                 owner_group_id=snapshot.tracking_control.tracking_owner_group_id,
             )
-            assert isinstance(group, TaskGroupInstance)
-            active_ids, passive_ids = _runtime_region_assignments(group)
-            task_group_id = group.group_instance_id
+            assert isinstance(runtime_group, TaskGroupInstance)
+            active_ids, passive_ids = _runtime_region_assignments(runtime_group)
+            task_group_id = runtime_group.group_instance_id
         else:
-            group = region_groups[0]
-            active_ids = (group.active_verifier_uuv_id,)
-            passive_ids = (group.passive_tracker_uuv_id,)
-            task_group_id = group.task_group_id
+            legacy_group = region_groups[0]
+            if not isinstance(legacy_group, TaskGroupAssignment):
+                raise TypeError("legacy execution requires TaskGroupAssignment groups")
+            active_ids = (legacy_group.active_verifier_uuv_id,)
+            passive_ids = (legacy_group.passive_tracker_uuv_id,)
+            task_group_id = legacy_group.task_group_id
         lifecycle = lifecycle_by_status[region.status]
         current_lifecycle = (current_region_lifecycles or {}).get(region.region_id)
         if current_lifecycle in {
@@ -233,11 +313,8 @@ def execution_snapshot_to_mission_plan(
             RegionLifecycle.CARRIER_RECOVERY,
         }:
             lifecycle = current_lifecycle
-        for uuv_id in group.member_uuv_ids:
-            resource_episodes[uuv_id] = 0
         coverage_ids = (*active_ids, *passive_ids)
         coverage_degraded_reasons: tuple[str, ...] = ()
-        coverage = 0.0
         try:
             scan_waypoints = serpentine_coverage_waypoints(
                 region.geometry,
@@ -256,21 +333,12 @@ def execution_snapshot_to_mission_plan(
             )
             if coverage_gap_m2 > 1e-6:
                 coverage_degraded_reasons = ("coverage_path_incomplete",)
-            if region.status == "active":
-                region_area_m2 = coverage_gap_area_m2(
-                    region.geometry,
-                    {},
-                    detection_radius_m,
-                )
-                coverage = max(0.0, 1.0 - coverage_gap_m2 / region_area_m2)
         except ValueError:
             # Preserve the authoritative task rather than silently dropping it.
             # The fallback is explicit and degraded; valid polygons take the
             # existing deterministic multi-UUV lane splitter above.
             scan_waypoints = region.geometry
-            scan_waypoints_by_uuv = {
-                uuv_id: region.geometry for uuv_id in coverage_ids
-            }
+            scan_waypoints_by_uuv = {uuv_id: region.geometry for uuv_id in coverage_ids}
             coverage_degraded_reasons = (
                 "coverage_path_unavailable",
                 "coverage_path_incomplete",
@@ -283,17 +351,13 @@ def execution_snapshot_to_mission_plan(
                 lifecycle=lifecycle,
                 active_scan_uuv_ids=active_ids,
                 passive_track_uuv_ids=passive_ids,
-                coverage=coverage,
+                coverage=0.0,
                 tracking_quality=1.0 if region.status in {"active", "passive"} else 0.0,
                 handoff_from=region.predecessor_region_id,
                 handoff_to=region.successor_region_id,
                 plan_revision=snapshot.execution_revision,
                 degraded_reasons=(
-                    *(
-                        ("execution_snapshot_degraded",)
-                        if snapshot.degradation.degraded
-                        else ()
-                    ),
+                    *(("execution_snapshot_degraded",) if snapshot.degradation.degraded else ()),
                     *coverage_degraded_reasons,
                 ),
                 region_polygon=region.geometry,
@@ -319,9 +383,7 @@ def _select_runtime_group(
     *,
     owner_group_id: str | None,
 ) -> TaskGroupInstance:
-    runtime_groups = tuple(
-        group for group in groups if isinstance(group, TaskGroupInstance)
-    )
+    runtime_groups = tuple(group for group in groups if isinstance(group, TaskGroupInstance))
     if not runtime_groups:
         raise ValueError("runtime execution region has no runtime task group")
     if owner_group_id is not None:
@@ -331,8 +393,7 @@ def _select_runtime_group(
     return max(
         runtime_groups,
         key=lambda group: (
-            group.lifecycle
-            not in {TaskGroupLifecycle.EXITING, TaskGroupLifecycle.DISAPPEARED},
+            group.lifecycle not in {TaskGroupLifecycle.EXITING, TaskGroupLifecycle.DISAPPEARED},
             _RUNTIME_GROUP_PROGRESS_ORDER[group.lifecycle],
             group.deployment_revision,
             group.group_instance_id,
@@ -398,16 +459,18 @@ def _runtime_projection_group(
     """Select the group representing a stable slot in a public projection."""
 
     if replacement is not None:
-        for group in groups:
-            if (
-                group.group_instance_id == replacement.incoming_group_id
-                and group.lifecycle is not TaskGroupLifecycle.DISAPPEARED
-            ):
-                return group
+        by_id = {group.group_instance_id: group for group in groups}
+        outgoing = by_id.get(replacement.outgoing_group_id)
+        incoming = by_id.get(replacement.incoming_group_id)
+        if outgoing is not None and outgoing.lifecycle not in {
+            TaskGroupLifecycle.EXITING,
+            TaskGroupLifecycle.DISAPPEARED,
+        }:
+            return outgoing
+        if incoming is not None and incoming.lifecycle is not TaskGroupLifecycle.DISAPPEARED:
+            return incoming
     visible = tuple(
-        group
-        for group in groups
-        if group.lifecycle is not TaskGroupLifecycle.DISAPPEARED
+        group for group in groups if group.lifecycle is not TaskGroupLifecycle.DISAPPEARED
     )
     if not visible:
         return None
@@ -592,20 +655,39 @@ class MissionController:
         """Mileage at which the current sortie enters its rotation reserve."""
         return self._max_mileage_m * self._resource_warning_mileage_fraction
 
+    def runtime_task_group(self, group_instance_id: str) -> TaskGroupInstance | None:
+        """Return one current immutable task group by its runtime identity.
+
+        Runtime consumers that already know the stable group identity should
+        not need to construct a full ``MissionSnapshot`` for a point lookup.
+        The returned ``TaskGroupInstance`` is frozen, so exposing it does not
+        expose mutable controller state.
+        """
+
+        return self._task_groups.get(group_instance_id)
+
+    def runtime_uuv_mode(self, uuv_id: str) -> UUVMissionMode | None:
+        """Return the current immutable mission mode for one UUV."""
+
+        return self._uuv_modes.get(uuv_id)
+
     def snapshot(self) -> MissionSnapshot:
         """Return a sorted immutable view of the current controller state."""
         return MissionSnapshot(
             scenario_id=self._scenario_id,
             sim_time_s=self._sim_time_s,
             plan_revision=self._plan_revision,
-            regions=tuple(
-                self._regions[region_id] for region_id in sorted(self._regions)
-            ),
+            regions=tuple(self._regions[region_id] for region_id in sorted(self._regions)),
             task_groups=tuple(
-                self._task_groups[group_id]
-                for group_id in sorted(self._task_groups)
+                self._task_groups[group_id] for group_id in sorted(self._task_groups)
             ),
             tracking_control=self._tracking_control,
+            pending_region_revisions={
+                region_id: state.latest_pending_region.geometry_revision
+                for region_id, state in sorted(self._replacement_states.items())
+                if state.latest_pending_region is not None
+            },
+            replacement_states=self.replacement_states,
             uuv_modes=dict(sorted(self._uuv_modes.items())),
             uuv_resources=dict(sorted(self._uuv_resources.items())),
             resource_episode_by_uuv=dict(sorted(self._resource_episode_by_uuv.items())),
@@ -650,18 +732,30 @@ class MissionController:
             if selected is None:
                 regions.append(region.model_copy(update={"task_group_id": None}))
                 continue
+            effective_region = region
+            stored_region = self._execution_regions.get(region.region_id)
+            if stored_region is not None:
+                # During a replacement the base snapshot may already contain a
+                # newer candidate geometry. The live group still operates on
+                # the stored geometry until the incoming group is ready.
+                effective_region = region.model_copy(
+                    update={
+                        "geometry": stored_region.geometry,
+                        "center": stored_region.center,
+                        "side_length_m": stored_region.side_length_m,
+                        "geometry_revision": stored_region.geometry_revision,
+                    }
+                )
             updates: dict[str, object] = {
                 "task_group_id": selected.group_instance_id,
             }
             status = _runtime_region_status(selected)
             if status is not None:
                 updates["status"] = status
-            regions.append(region.model_copy(update=updates))
+            regions.append(effective_region.model_copy(update=updates))
         current_region_id = base_snapshot.current_region_id
         next_region_id = base_snapshot.next_region_id
-        owner = self._task_groups.get(
-            self._tracking_control.tracking_owner_group_id or ""
-        )
+        owner = self._task_groups.get(self._tracking_control.tracking_owner_group_id or "")
         if owner is not None and owner.lifecycle is not TaskGroupLifecycle.DISAPPEARED:
             current_region_id = owner.region_id
             owner_region = self._execution_regions.get(owner.region_id)
@@ -676,8 +770,7 @@ class MissionController:
             update={
                 "regions": tuple(regions),
                 "task_groups": tuple(
-                    self._task_groups[group_id]
-                    for group_id in sorted(self._task_groups)
+                    self._task_groups[group_id] for group_id in sorted(self._task_groups)
                 ),
                 "tracking_control": self._tracking_control,
                 "current_region_id": current_region_id,
@@ -753,6 +846,7 @@ class MissionController:
         expected_current_revision: int,
         preserve_region_progress: bool = True,
         execution_regions: Mapping[str, ExecutionRegion] | None = None,
+        coalesce_pending_geometry: bool = False,
     ) -> bool:
         """Refresh the controller projection for an already committed revision."""
         if self._plan_revision != expected_current_revision:
@@ -762,6 +856,7 @@ class MissionController:
             allow_same_revision=True,
             preserve_region_progress=preserve_region_progress,
             execution_regions=execution_regions,
+            coalesce_pending_geometry=coalesce_pending_geometry,
         )
 
     @property
@@ -774,6 +869,7 @@ class MissionController:
         *,
         preserve_region_progress: bool = True,
         execution_regions: Mapping[str, ExecutionRegion] | None = None,
+        coalesce_pending_geometry: bool = False,
     ) -> bool:
         """Atomically apply only a strictly newer executable plan."""
         return self._apply_plan(
@@ -781,6 +877,7 @@ class MissionController:
             allow_same_revision=False,
             preserve_region_progress=preserve_region_progress,
             execution_regions=execution_regions,
+            coalesce_pending_geometry=coalesce_pending_geometry,
         )
 
     @property
@@ -812,9 +909,7 @@ class MissionController:
         if snapshot.scenario_id != self._scenario_id:
             return False
         expected = (
-            self._plan_revision
-            if expected_current_revision is None
-            else expected_current_revision
+            self._plan_revision if expected_current_revision is None else expected_current_revision
         )
         if self._plan_revision != expected:
             return False
@@ -832,9 +927,7 @@ class MissionController:
                 ),
                 allow_same_revision=False,
                 preserve_region_progress=False,
-                execution_regions={
-                    region.region_id: region for region in snapshot.regions
-                },
+                execution_regions={region.region_id: region for region in snapshot.regions},
             )
         except Exception:  # noqa: BLE001 - restore the complete controller boundary
             self.restore(checkpoint)
@@ -847,6 +940,8 @@ class MissionController:
     def reconcile_execution_snapshot(
         self,
         candidate: OperationalExecutionSnapshot | Mapping[str, Any],
+        *,
+        coalesce_pending_geometry: bool = False,
     ) -> MissionSnapshot:
         """Reconcile an execution refresh while retaining live group progress.
 
@@ -881,8 +976,7 @@ class MissionController:
         checkpoint = self.checkpoint()
         try:
             current_region_lifecycles = {
-                region.region_id: region.lifecycle
-                for region in self._regions.values()
+                region.region_id: region.lifecycle for region in self._regions.values()
             }
             applied = self._apply_plan(
                 execution_snapshot_to_mission_plan(
@@ -891,9 +985,8 @@ class MissionController:
                 ),
                 allow_same_revision=True,
                 preserve_region_progress=True,
-                execution_regions={
-                    region.region_id: region for region in candidate.regions
-                },
+                execution_regions={region.region_id: region for region in candidate.regions},
+                coalesce_pending_geometry=coalesce_pending_geometry,
             )
         except Exception:  # noqa: BLE001 - reconcile is an atomic boundary
             self.restore(checkpoint)
@@ -909,6 +1002,7 @@ class MissionController:
         allow_same_revision: bool,
         preserve_region_progress: bool = True,
         execution_regions: Mapping[str, ExecutionRegion] | None = None,
+        coalesce_pending_geometry: bool = False,
     ) -> bool:
         """Build and install a complete plan projection without partial writes."""
         if plan.revision < self._plan_revision or (
@@ -919,25 +1013,27 @@ class MissionController:
             group for group in plan.task_groups if isinstance(group, TaskGroupInstance)
         )
         legacy_groups = tuple(
-            group
-            for group in plan.task_groups
-            if not isinstance(group, TaskGroupInstance)
+            group for group in plan.task_groups if not isinstance(group, TaskGroupInstance)
         )
         if runtime_groups and legacy_groups:
             return False
         new_regions = {
-            region.region_id: region.model_copy(deep=True)
+            region.region_id: region.model_copy(
+                update={"entry_confirmation_required": self._confirm_cycles},
+                deep=True,
+            )
             for region in plan.region_assignments
         }
         if runtime_groups:
             new_runtime_groups, new_tracking_control, new_replacement_states = (
                 self._merge_runtime_groups(
-                runtime_groups,
-                plan.tracking_control,
-                preserve_progress=preserve_region_progress,
-                candidate_regions=execution_regions,
-                candidate_region_assignments=new_regions,
-            )
+                    runtime_groups,
+                    plan.tracking_control,
+                    preserve_progress=preserve_region_progress,
+                    candidate_regions=execution_regions,
+                    candidate_region_assignments=new_regions,
+                    coalesce_pending_geometry=coalesce_pending_geometry,
+                )
             )
         else:
             new_runtime_groups = {}
@@ -988,24 +1084,146 @@ class MissionController:
                 else region
                 for region_id, region in new_regions.items()
             }
+            for region_id, replacement in new_replacement_states.items():
+                previous_region = previous_regions.get(region_id)
+                stored_region = self._execution_regions.get(region_id)
+                if (
+                    previous_region is None
+                    or stored_region is None
+                    or replacement.outgoing_group_id not in self._task_groups
+                ):
+                    continue
+                # Keep physical scan evidence on the geometry that is still
+                # active until the outgoing group has actually disappeared.
+                # When the public projection has already selected the
+                # incoming group, rebuild the route map on that same geometry
+                # so its stable member IDs do not fall back to one shared
+                # first waypoint in the engine.
+                coverage_ids = (
+                    *new_regions[region_id].active_scan_uuv_ids,
+                    *new_regions[region_id].passive_track_uuv_ids,
+                )
+                route_ids = tuple(previous_region.scan_waypoints_by_uuv)
+                preserved_scan_waypoints = previous_region.scan_waypoints
+                preserved_routes = deepcopy(previous_region.scan_waypoints_by_uuv)
+                if coverage_ids and set(coverage_ids) != set(route_ids):
+                    try:
+                        preserved_scan_waypoints = serpentine_coverage_waypoints(
+                            stored_region.geometry,
+                            lane_count=max(1, len(coverage_ids)),
+                        )
+                        preserved_routes = serpentine_coverage_waypoints_by_uuv(
+                            stored_region.geometry,
+                            coverage_ids,
+                            start_point=stored_region.geometry[0],
+                        )
+                    except (IndexError, ValueError):
+                        # The authoritative geometry is still retained.  A
+                        # malformed fallback remains visible for diagnostics,
+                        # but never invents routes for unknown members.
+                        preserved_routes = {
+                            member_id: route
+                            for member_id, route in preserved_routes.items()
+                            if member_id in coverage_ids
+                        }
+                new_regions[region_id] = new_regions[region_id].model_copy(
+                    update={
+                        "region_polygon": stored_region.geometry,
+                        "scan_waypoints": preserved_scan_waypoints,
+                        "scan_waypoints_by_uuv": preserved_routes,
+                    }
+                )
+        for region_id, region in tuple(new_regions.items()):
+            coverage_ids = (
+                *region.active_scan_uuv_ids,
+                *region.passive_track_uuv_ids,
+            )
+            if not coverage_ids:
+                continue
+            current_routes = region.scan_waypoints_by_uuv
+            if _runtime_routes_are_usable(current_routes, coverage_ids):
+                continue
+
+            rekeyed_routes = _rekey_runtime_routes_by_member_slot(
+                current_routes,
+                coverage_ids,
+            )
+            if rekeyed_routes is None:
+                previous_region = previous_regions.get(region_id)
+                if previous_region is not None:
+                    rekeyed_routes = _rekey_runtime_routes_by_member_slot(
+                        previous_region.scan_waypoints_by_uuv,
+                        coverage_ids,
+                    )
+            if rekeyed_routes is not None:
+                new_regions[region_id] = region.model_copy(
+                    update={"scan_waypoints_by_uuv": rekeyed_routes}
+                )
+                continue
+
+            geometries: list[tuple[tuple[float, float], ...]] = []
+            for geometry in (
+                region.region_polygon,
+                previous_regions.get(region_id).region_polygon
+                if previous_regions.get(region_id) is not None
+                else (),
+                self._execution_regions[region_id].geometry
+                if region_id in self._execution_regions
+                else (),
+            ):
+                if geometry and geometry not in geometries:
+                    geometries.append(geometry)
+            for geometry in geometries:
+                try:
+                    generated_routes = serpentine_coverage_waypoints_by_uuv(
+                        geometry,
+                        coverage_ids,
+                        start_point=geometry[0],
+                    )
+                    generated_scan_waypoints = serpentine_coverage_waypoints(
+                        geometry,
+                        lane_count=max(1, len(coverage_ids)),
+                    )
+                except (IndexError, ValueError):
+                    continue
+                if not _runtime_routes_are_usable(generated_routes, coverage_ids):
+                    continue
+                new_regions[region_id] = region.model_copy(
+                    update={
+                        "region_polygon": geometry,
+                        "scan_waypoints": generated_scan_waypoints,
+                        "scan_waypoints_by_uuv": generated_routes,
+                    }
+                )
+                break
+            else:
+                # Keep the contract keyed by the current members. An empty
+                # route is explicit degradation; the executor must not turn
+                # it into one shared waypoint.
+                new_regions[region_id] = region.model_copy(
+                    update={
+                        "scan_waypoints_by_uuv": {
+                            member_id: () for member_id in coverage_ids
+                        }
+                    }
+                )
         preserved_recovered_uuv_ids_by_region: dict[str, set[str]] = {}
         for region_id, region in new_regions.items():
-            previous = previous_regions.get(region_id)
+            previous_region = previous_regions.get(region_id)
             assigned = {
                 *region.active_scan_uuv_ids,
                 *region.passive_track_uuv_ids,
             }
             if (
-                previous is not None
-                and previous.lifecycle
+                previous_region is not None
+                and previous_region.lifecycle
                 in {RegionLifecycle.CARRIER_RECOVERY, RegionLifecycle.RECOVERED}
                 and region.lifecycle
                 in {RegionLifecycle.CARRIER_RECOVERY, RegionLifecycle.RECOVERED}
-                and _region_plan_assignments_match(previous, region)
+                and _region_plan_assignments_match(previous_region, region)
             ):
                 preserved_recovered_uuv_ids_by_region[region_id] = (
-                    previous_recovered_uuv_ids_by_region.get(region_id, set())
-                    & assigned
+                    previous_recovered_uuv_ids_by_region.get(region_id, set()) & assigned
                 )
             else:
                 preserved_recovered_uuv_ids_by_region[region_id] = set()
@@ -1017,12 +1235,9 @@ class MissionController:
                 previous_replacement = self._replacement_states.get(region_id)
                 if (
                     previous_replacement is None
-                    or previous_replacement.outgoing_group_id
-                    not in self._task_groups
+                    or previous_replacement.outgoing_group_id not in self._task_groups
                 ):
-                    new_execution_regions[region_id] = candidate_region.model_copy(
-                        deep=True
-                    )
+                    new_execution_regions[region_id] = candidate_region.model_copy(deep=True)
         elif not runtime_groups:
             new_execution_regions = {}
 
@@ -1038,8 +1253,8 @@ class MissionController:
                 *carrier.recoverable_uuv_ids,
             )
             for uuv_id in inventory:
-                previous = new_uuv_carrier_ids.get(uuv_id)
-                if previous is not None and previous != carrier_id:
+                previous_carrier_id = new_uuv_carrier_ids.get(uuv_id)
+                if previous_carrier_id is not None and previous_carrier_id != carrier_id:
                     return False
                 new_uuv_carrier_ids[uuv_id] = carrier_id
                 if uuv_id in carrier.recoverable_uuv_ids:
@@ -1049,8 +1264,8 @@ class MissionController:
 
         for batch in plan.batches:
             for uuv_id in batch.uuv_ids:
-                previous = new_uuv_carrier_ids.get(uuv_id)
-                if previous is not None and previous != batch.carrier_id:
+                previous_carrier_id = new_uuv_carrier_ids.get(uuv_id)
+                if previous_carrier_id is not None and previous_carrier_id != batch.carrier_id:
                     return False
                 new_modes[uuv_id] = UUVMissionMode.TRANSIT_TO_REGION
                 new_uuv_carrier_ids[uuv_id] = batch.carrier_id
@@ -1072,13 +1287,15 @@ class MissionController:
                     new_modes[uuv_id] = mode
         else:
             active_execution_uuv_ids: set[str] = set()
-            for group in plan.task_groups:
-                if len(group.member_uuv_ids) != 2:
+            for legacy_task_group in plan.task_groups:
+                if not isinstance(legacy_task_group, TaskGroupAssignment):
                     return False
-                new_modes[group.active_verifier_uuv_id] = UUVMissionMode.ACTIVE_SCAN
-                new_modes[group.passive_tracker_uuv_id] = UUVMissionMode.PASSIVE_TRACK
-                if group.status != "complete":
-                    active_execution_uuv_ids.add(group.active_verifier_uuv_id)
+                if len(legacy_task_group.member_uuv_ids) != 2:
+                    return False
+                new_modes[legacy_task_group.active_verifier_uuv_id] = UUVMissionMode.ACTIVE_SCAN
+                new_modes[legacy_task_group.passive_tracker_uuv_id] = UUVMissionMode.PASSIVE_TRACK
+                if legacy_task_group.status != "complete":
+                    active_execution_uuv_ids.add(legacy_task_group.active_verifier_uuv_id)
             for region in new_regions.values():
                 if region.lifecycle is RegionLifecycle.PASSIVE_TRACK:
                     for uuv_id in (
@@ -1117,10 +1334,7 @@ class MissionController:
         # is in progress.  Rebuilding task-group modes must not cancel that
         # lifecycle transition before the boundary-exit observation arrives.
         for uuv_id, previous_mode in self._uuv_modes.items():
-            if (
-                previous_mode is UUVMissionMode.RETURN_REQUIRED
-                and uuv_id in new_modes
-            ):
+            if previous_mode is UUVMissionMode.RETURN_REQUIRED and uuv_id in new_modes:
                 new_modes[uuv_id] = previous_mode
 
         # A rolling plan is a complete fleet state, but it must not make an
@@ -1152,9 +1366,9 @@ class MissionController:
         # so a rolling refresh cannot erase recovery bookkeeping.
         if not plan.carrier_missions and not plan.batches:
             for uuv_id in new_modes:
-                carrier_id = previous_uuv_carrier_ids.get(uuv_id)
-                if carrier_id is not None:
-                    new_uuv_carrier_ids.setdefault(uuv_id, carrier_id)
+                preserved_carrier_id = previous_uuv_carrier_ids.get(uuv_id)
+                if preserved_carrier_id is not None:
+                    new_uuv_carrier_ids.setdefault(uuv_id, preserved_carrier_id)
 
         new_carrier_missions = {
             carrier_id: carrier.model_copy(deep=True)
@@ -1177,19 +1391,13 @@ class MissionController:
             new_carrier_missions[recovery_carrier_id] = recovery_carrier.model_copy(
                 update={
                     "onboard_uuv_ids": tuple(
-                        item
-                        for item in recovery_carrier.onboard_uuv_ids
-                        if item != uuv_id
+                        item for item in recovery_carrier.onboard_uuv_ids if item != uuv_id
                     ),
                     "ready_uuv_ids": tuple(
-                        item
-                        for item in recovery_carrier.ready_uuv_ids
-                        if item != uuv_id
+                        item for item in recovery_carrier.ready_uuv_ids if item != uuv_id
                     ),
                     "reserved_uuv_ids": tuple(
-                        item
-                        for item in recovery_carrier.reserved_uuv_ids
-                        if item != uuv_id
+                        item for item in recovery_carrier.reserved_uuv_ids if item != uuv_id
                     ),
                     "recoverable_uuv_ids": tuple(
                         sorted({*recovery_carrier.recoverable_uuv_ids, uuv_id})
@@ -1213,8 +1421,7 @@ class MissionController:
         self._uuv_carrier_ids = new_uuv_carrier_ids
         self._recovered_uuv_ids_by_region = preserved_recovered_uuv_ids_by_region
         self._resource_episode_by_uuv = {
-            uuv_id: self._resource_episode_by_uuv.get(uuv_id, 0)
-            for uuv_id in new_modes
+            uuv_id: self._resource_episode_by_uuv.get(uuv_id, 0) for uuv_id in new_modes
         }
         self._uuv_resources = {
             uuv_id: resource
@@ -1261,6 +1468,7 @@ class MissionController:
         preserve_progress: bool,
         candidate_regions: Mapping[str, ExecutionRegion] | None = None,
         candidate_region_assignments: Mapping[str, RegionMissionState] | None = None,
+        coalesce_pending_geometry: bool = False,
     ) -> tuple[
         dict[str, TaskGroupInstance],
         TrackingControlState,
@@ -1316,9 +1524,7 @@ class MissionController:
 
         for region_id, candidate in sorted(candidates_by_region.items()):
             current_groups = current_by_region.get(region_id, ())
-            previous_state = (
-                replacement_states.get(region_id) if preserve_progress else None
-            )
+            previous_state = replacement_states.get(region_id) if preserve_progress else None
             if previous_state is not None and (
                 previous_state.outgoing_group_id not in self._task_groups
             ):
@@ -1339,9 +1545,7 @@ class MissionController:
             geometry_changed = (
                 _region_geometry_changed(stored_region, next_region)
                 if next_region is not None
-                else _mission_region_geometry_changed(
-                    self._regions.get(region_id), assigned_region
-                )
+                else _mission_region_geometry_changed(self._regions.get(region_id), assigned_region)
             )
 
             if previous_state is not None:
@@ -1350,13 +1554,16 @@ class MissionController:
                 if (
                     next_region is not None
                     and geometry_changed
-                    and next_region.geometry_revision
-                    > previous_state.target_geometry_revision
+                    and next_region.geometry_revision > previous_state.target_geometry_revision
                 ):
                     replacement_states[region_id] = previous_state.model_copy(
                         update={
-                            "target_geometry_revision": next_region.geometry_revision,
+                            "coalesce_pending_geometry": (
+                                previous_state.coalesce_pending_geometry
+                                or coalesce_pending_geometry
+                            ),
                             "latest_pending_region": next_region.model_copy(deep=True),
+                            "latest_pending_group": candidate.model_copy(deep=True),
                         }
                     )
                 continue
@@ -1366,65 +1573,86 @@ class MissionController:
                 preserve_progress
                 and current_group is not None
                 and geometry_changed
+                and (
+                    current_group.group_instance_id == candidate.group_instance_id
+                    or (
+                        candidate.lifecycle is current_group.lifecycle
+                        and tuple(candidate.evidence_ids)
+                        == tuple(current_group.evidence_ids)
+                    )
+                )
                 and set(current_group.member_uuv_ids)
                 == set(candidate.member_uuv_ids)
             ):
                 # A rolling execution refresh may produce a new deployment
                 # instance while retaining the same physical UUV assignment.
-                # Keep the live instance and lifecycle; the candidate region
-                # still updates below and the engine can re-plan its route
-                # without forcing a return/redeploy transition.
+                # Reusing the evidence identity marks it as metadata refresh;
+                # a new evidence identity is a new physical generation and
+                # must receive fresh IDs when its members are still deployed.
+                # Keep the live instance and lifecycle for the refresh case;
+                # the candidate region still updates below and the engine can
+                # re-plan its route without forcing a return/redeploy cycle.
+                merged[current_group.group_instance_id] = current_group.model_copy(
+                    deep=True
+                )
+                continue
+            if (
+                preserve_progress
+                and coalesce_pending_geometry
+                and current_group is not None
+                and current_group.lifecycle
+                in {
+                    *_RUNTIME_ACTIVE_GROUP_LIFECYCLES,
+                    *_RUNTIME_PASSIVE_GROUP_LIFECYCLES,
+                }
+                and current_group.source_group_instance_id is not None
+                and geometry_changed
+            ):
+                # The execution snapshot factory emits a new candidate
+                # identity for every rolling prediction revision. Once the
+                # physical group is live, that revision is a route/geometry
+                # refresh, not a second deployment generation.
                 merged[current_group.group_instance_id] = current_group.model_copy(
                     deep=True
                 )
                 continue
             if not preserve_progress or current_group is None or not geometry_changed:
                 if current_group is not None and preserve_progress:
-                    merged[current_group.group_instance_id] = current_group.model_copy(
-                        deep=True
-                    )
+                    merged[current_group.group_instance_id] = current_group.model_copy(deep=True)
                 else:
-                    merged[candidate.group_instance_id] = candidate.model_copy(
-                        deep=True
-                    )
+                    merged[candidate.group_instance_id] = candidate.model_copy(deep=True)
+                continue
+
+            if current_group.group_instance_id == candidate.group_instance_id:
+                # Runtime projections may carry a newer authoritative region
+                # geometry while replaying the same physical deployment. The
+                # identity match makes this an idempotent refresh, not a
+                # replacement with the same outgoing and incoming group.
+                merged[current_group.group_instance_id] = current_group.model_copy(deep=True)
                 continue
 
             current_is_owner = (
-                current_group.group_instance_id
-                == self._tracking_control.tracking_owner_group_id
+                current_group.group_instance_id == self._tracking_control.tracking_owner_group_id
             )
+            waterborne_member_ids = {
+                member_id
+                for group in (*current_groups, *merged.values())
+                if group.lifecycle is not TaskGroupLifecycle.DISAPPEARED
+                for member_id in group.member_uuv_ids
+            }
+            incoming_member_ids = candidate.member_uuv_ids
+            if waterborne_member_ids.intersection(incoming_member_ids):
+                incoming_member_ids = deployment_member_uuv_ids(candidate.group_instance_id)
             incoming_updates: dict[str, object] = {
                 "source_group_instance_id": current_group.group_instance_id,
                 "reason": "region_replacement",
+                "member_uuv_ids": incoming_member_ids,
+                "lifecycle": TaskGroupLifecycle.ENTERING,
+                "sensor_mode": GroupSensorMode.ACTIVE,
             }
             if current_is_owner:
-                incoming_updates.update(
-                    {
-                        "lifecycle": TaskGroupLifecycle.PASSIVE_TRACK,
-                        "sensor_mode": GroupSensorMode.PASSIVE,
-                    }
-                )
                 pending_successor_id = candidate.group_instance_id
-                outgoing = current_group.model_copy(
-                    update={
-                        "lifecycle": TaskGroupLifecycle.EXITING,
-                        "sensor_mode": GroupSensorMode.PASSIVE,
-                    },
-                    deep=True,
-                )
-            else:
-                incoming_updates.update(
-                    {
-                        "lifecycle": TaskGroupLifecycle.ENTERING,
-                        "sensor_mode": GroupSensorMode.ACTIVE,
-                    }
-                )
-                outgoing = current_group.model_copy(
-                    update={
-                        "lifecycle": TaskGroupLifecycle.EXITING,
-                        "sensor_mode": GroupSensorMode.PASSIVE,
-                    }
-                )
+            outgoing = current_group.model_copy(deep=True)
             incoming = candidate.model_copy(update=incoming_updates, deep=True)
             merged[outgoing.group_instance_id] = outgoing
             merged[incoming.group_instance_id] = incoming
@@ -1434,9 +1662,7 @@ class MissionController:
                 else max(0, candidate.deployment_revision - 1)
             )
             target_revision = (
-                next_region.geometry_revision
-                if next_region is not None
-                else source_revision + 1
+                next_region.geometry_revision if next_region is not None else source_revision + 1
             )
             replacement_states[region_id] = RegionReplacementState(
                 region_id=region_id,
@@ -1444,15 +1670,28 @@ class MissionController:
                 target_geometry_revision=max(source_revision + 1, target_revision),
                 outgoing_group_id=outgoing.group_instance_id,
                 incoming_group_id=incoming.group_instance_id,
+                coalesce_pending_geometry=coalesce_pending_geometry,
             )
 
         owner_id = tracking_control.tracking_owner_group_id
+        if preserve_progress:
+            previous_owner_id = self._tracking_control.tracking_owner_group_id
+            previous_owner = (
+                merged.get(previous_owner_id) if previous_owner_id is not None else None
+            )
+            if (
+                previous_owner is not None
+                and previous_owner.lifecycle in _RUNTIME_PASSIVE_GROUP_LIFECYCLES
+                and pending_successor_id is not None
+            ):
+                # A newer plan can nominate the replacement group, but the
+                # physical owner transfers only after current-cycle 3/3
+                # readiness and observation evidence are accepted.
+                owner_id = previous_owner_id
         if owner_id is None and preserve_progress:
             previous_owner_id = self._tracking_control.tracking_owner_group_id
             previous_owner = (
-                merged.get(previous_owner_id)
-                if previous_owner_id is not None
-                else None
+                merged.get(previous_owner_id) if previous_owner_id is not None else None
             )
             if previous_owner is not None and previous_owner.lifecycle in {
                 *(_RUNTIME_PASSIVE_GROUP_LIFECYCLES),
@@ -1464,9 +1703,7 @@ class MissionController:
             pending_successor_id = None
         if pending_successor_id not in merged:
             pending_successor_id = (
-                self._tracking_control.pending_successor_group_id
-                if preserve_progress
-                else None
+                self._tracking_control.pending_successor_group_id if preserve_progress else None
             )
         if pending_successor_id not in merged:
             pending_successor_id = None
@@ -1474,13 +1711,9 @@ class MissionController:
         normalized: dict[str, TaskGroupInstance] = {}
         for group_id, group in merged.items():
             if group_id == owner_id:
-                normalized[group_id] = group.model_copy(
-                    update={"ownership_status": "owner"}
-                )
+                normalized[group_id] = group.model_copy(update={"ownership_status": "owner"})
             elif group.ownership_status == "owner":
-                normalized[group_id] = group.model_copy(
-                    update={"ownership_status": "candidate"}
-                )
+                normalized[group_id] = group.model_copy(update={"ownership_status": "candidate"})
             else:
                 normalized[group_id] = group
         return (
@@ -1503,9 +1736,7 @@ class MissionController:
         """Set one whole group atomically and mirror its three UUV modes."""
 
         group = self._task_groups[group_instance_id]
-        updated = group.model_copy(
-            update={"lifecycle": lifecycle, "sensor_mode": sensor_mode}
-        )
+        updated = group.model_copy(update={"lifecycle": lifecycle, "sensor_mode": sensor_mode})
         self._task_groups[group_instance_id] = updated
         member_mode = _runtime_uuv_mode(updated)
         for member_id in updated.member_uuv_ids:
@@ -1533,8 +1764,12 @@ class MissionController:
         if group is None or group.lifecycle not in _RUNTIME_PASSIVE_GROUP_LIFECYCLES:
             return
         for current_id, current in tuple(self._task_groups.items()):
-            desired_status = "owner" if current_id == group_instance_id else (
-                "candidate" if current.ownership_status == "owner" else current.ownership_status
+            desired_status = (
+                "owner"
+                if current_id == group_instance_id
+                else (
+                    "candidate" if current.ownership_status == "owner" else current.ownership_status
+                )
             )
             if current.ownership_status != desired_status:
                 self._task_groups[current_id] = current.model_copy(
@@ -1567,14 +1802,11 @@ class MissionController:
             )
             or (
                 self._tracking_control.mode == "dedicated"
-                and self._tracking_control.pending_successor_group_id
-                != new_group_id
+                and self._tracking_control.pending_successor_group_id != new_group_id
             )
         ):
             return False
-        self._task_groups[new_group_id] = new_group.model_copy(
-            update={"ownership_status": "owner"}
-        )
+        self._task_groups[new_group_id] = new_group.model_copy(update={"ownership_status": "owner"})
         self._task_groups[old_group_id] = old_group.model_copy(
             update={"ownership_status": "candidate"}
         )
@@ -1583,10 +1815,9 @@ class MissionController:
                 "mode": "regional",
                 "tracking_owner_group_id": new_group_id,
                 "pending_successor_group_id": None,
+                "handoff_blocked_reason": None,
                 "source_event_ids": tuple(
-                    dict.fromkeys(
-                        (*self._tracking_control.source_event_ids, *evidence_ids)
-                    )
+                    dict.fromkeys((*self._tracking_control.source_event_ids, *evidence_ids))
                 ),
             }
         )
@@ -1642,10 +1873,7 @@ class MissionController:
         state = self._replacement_states.get(region_id)
         if state is None:
             return False
-        if (
-            incoming_group_id is not None
-            and incoming_group_id != state.incoming_group_id
-        ):
+        if incoming_group_id is not None and incoming_group_id != state.incoming_group_id:
             return False
         outgoing = self._task_groups.get(state.outgoing_group_id)
         incoming = self._task_groups.get(state.incoming_group_id)
@@ -1693,7 +1921,99 @@ class MissionController:
             },
             dedupe_id=f"region-replacement-completed:{region_id}:{outgoing.group_instance_id}",
         )
-        self._replacement_states.pop(region_id, None)
+        pending_region = state.latest_pending_region
+        pending_group = state.latest_pending_group
+        if pending_region is None or pending_group is None:
+            self._replacement_states.pop(region_id, None)
+            return True
+        if pending_group.group_instance_id == incoming.group_instance_id:
+            self._execution_regions[region_id] = pending_region.model_copy(deep=True)
+            self._replacement_states.pop(region_id, None)
+            return True
+        if state.coalesce_pending_geometry:
+            # A live execution refresh may supersede the pending geometry while
+            # the incoming group is already physically deployed. Apply the
+            # newest geometry to that same group after the outgoing boundary
+            # exit; a new physical generation would repeat the replacement.
+            self._execution_regions[region_id] = pending_region.model_copy(deep=True)
+            self._replacement_states.pop(region_id, None)
+            self._emit(
+                "region_replacement_geometry_coalesced",
+                region_id,
+                {
+                    "incoming_group_id": incoming.group_instance_id,
+                    "geometry_revision": pending_region.geometry_revision,
+                    "reason": "latest_pending_geometry",
+                },
+                dedupe_id=(
+                    f"region-replacement-geometry-coalesced:"
+                    f"{region_id}:{pending_region.geometry_revision}"
+                ),
+            )
+            return True
+
+        occupied_member_ids = {
+            member_id
+            for group in self._task_groups.values()
+            if group.lifecycle is not TaskGroupLifecycle.DISAPPEARED
+            for member_id in group.member_uuv_ids
+        }
+        pending_member_ids = pending_group.member_uuv_ids
+        if occupied_member_ids.intersection(pending_member_ids):
+            pending_member_ids = deployment_member_uuv_ids(pending_group.group_instance_id)
+        next_group = pending_group.model_copy(
+            deep=True,
+            update={
+                "source_group_instance_id": incoming.group_instance_id,
+                "reason": "region_replacement",
+                "member_uuv_ids": pending_member_ids,
+                "lifecycle": TaskGroupLifecycle.ENTERING,
+                "sensor_mode": GroupSensorMode.ACTIVE,
+                "ownership_status": "candidate",
+            },
+        )
+        self._task_groups[next_group.group_instance_id] = next_group
+        for member_id in next_group.member_uuv_ids:
+            self._uuv_modes[member_id] = UUVMissionMode.TRANSIT_TO_REGION
+            self._resource_episode_by_uuv.setdefault(member_id, 0)
+        self._execution_regions[region_id] = pending_region.model_copy(deep=True)
+        self._replacement_states[region_id] = RegionReplacementState(
+            region_id=region_id,
+            source_geometry_revision=state.target_geometry_revision,
+            target_geometry_revision=pending_region.geometry_revision,
+            outgoing_group_id=incoming.group_instance_id,
+            incoming_group_id=next_group.group_instance_id,
+        )
+        if self._tracking_control.tracking_owner_group_id == incoming.group_instance_id:
+            self._tracking_control = self._tracking_control.model_copy(
+                update={"pending_successor_group_id": next_group.group_instance_id}
+            )
+        self._emit(
+            "region_replacement_started",
+            region_id,
+            {
+                "target_id": next_group.target_id,
+                "region_id": region_id,
+                "geometry_revision": pending_region.geometry_revision,
+                "outgoing_group_id": incoming.group_instance_id,
+                "incoming_group_id": next_group.group_instance_id,
+                "member_uuv_ids": next_group.member_uuv_ids,
+                "reason": "latest_pending_region",
+            },
+            dedupe_id=(f"region-replacement-started:{region_id}:{next_group.group_instance_id}"),
+        )
+        self._emit(
+            "task_group_entering",
+            next_group.group_instance_id,
+            {
+                "target_id": next_group.target_id,
+                "region_id": region_id,
+                "group_instance_id": next_group.group_instance_id,
+                "member_uuv_ids": next_group.member_uuv_ids,
+                "reason": "region_replacement",
+            },
+            dedupe_id=f"task-group-entering:{next_group.group_instance_id}",
+        )
         return True
 
     def set_dedicated_owner(self, target_id: str, owner_group_id: str) -> bool:
@@ -1716,13 +2036,9 @@ class MissionController:
         ):
             return False
         target_groups = tuple(
-            group
-            for group in self._task_groups.values()
-            if group.target_id == target_id
+            group for group in self._task_groups.values() if group.target_id == target_id
         )
-        owner_groups = tuple(
-            group for group in target_groups if group.ownership_status == "owner"
-        )
+        owner_groups = tuple(group for group in target_groups if group.ownership_status == "owner")
         if len(owner_groups) != 1 or owner_groups[0].group_instance_id != owner_group_id:
             return False
 
@@ -1746,9 +2062,7 @@ class MissionController:
                     "dedicated_release_triggered_at_m": None,
                     "dedicated_release_reason": None,
                     "source_event_ids": tuple(
-                        dict.fromkeys(
-                            (*self._tracking_control.source_event_ids, event_id)
-                        )
+                        dict.fromkeys((*self._tracking_control.source_event_ids, event_id))
                     ),
                 }
             )
@@ -1828,9 +2142,7 @@ class MissionController:
                 "dedicated_release_triggered_at_m": remaining_m,
                 "dedicated_release_reason": "mileage_threshold",
                 "source_event_ids": tuple(
-                    dict.fromkeys(
-                        (*self._tracking_control.source_event_ids, event_id)
-                    )
+                    dict.fromkeys((*self._tracking_control.source_event_ids, event_id))
                 ),
             }
         )
@@ -1873,9 +2185,9 @@ class MissionController:
                 dedupe_id=f"dedicated-restore-regions:{owner.group_instance_id}",
             )
             return
-        deployment_revision = max(
-            group.deployment_revision for group in self._task_groups.values()
-        ) + 1
+        deployment_revision = (
+            max(group.deployment_revision for group in self._task_groups.values()) + 1
+        )
         threshold_event_id = (
             f"{self._scenario_id}:dedicated_release_threshold_reached:"
             f"{owner.group_instance_id}:r{self._plan_revision}:e0:{self._sim_time_s}"
@@ -1909,14 +2221,14 @@ class MissionController:
                 target_id=owner.target_id,
                 region_id=region.region_id,
                 deployment_revision=deployment_revision,
-                member_uuv_ids=tuple(
-                    f"{group_id}:member:{index:02d}" for index in range(1, 4)
-                ),
+                member_uuv_ids=tuple(f"{group_id}:member:{index:02d}" for index in range(1, 4)),
                 lifecycle=lifecycle,
                 sensor_mode=sensor_mode,
                 ownership_status="candidate",
                 entry_boundary_point=region.geometry[0],
-                source_group_instance_id=owner.group_instance_id,
+                source_group_instance_id=(
+                    outgoing.group_instance_id if outgoing is not None else owner.group_instance_id
+                ),
                 reason="dedicated_restore",
                 evidence_ids=(threshold_event_id,),
             )
@@ -2136,11 +2448,7 @@ class MissionController:
         """Accept a boundary-exit observation and make the UUV unavailable."""
         if self._uuv_modes.get(uuv_id) is not UUVMissionMode.RETURN_REQUIRED:
             return False
-        return bool(
-            self._apply_boundary_exit_observations(
-                {"boundary_exited_uuv_ids": (uuv_id,)}
-            )
-        )
+        return bool(self._apply_boundary_exit_observations({"boundary_exited_uuv_ids": (uuv_id,)}))
 
     def begin_boundary_entry(
         self,
@@ -2217,9 +2525,7 @@ class MissionController:
             }
         )
         self._uuv_modes[incoming_uuv_id] = (
-            UUVMissionMode.ACTIVE_SCAN
-            if role == "active_scan"
-            else UUVMissionMode.PASSIVE_TRACK
+            UUVMissionMode.ACTIVE_SCAN if role == "active_scan" else UUVMissionMode.PASSIVE_TRACK
         )
         self._resource_episode_by_uuv[incoming_uuv_id] = (
             self._resource_episode_by_uuv.get(incoming_uuv_id, 0) + 1
@@ -2273,7 +2579,9 @@ class MissionController:
             self._apply_runtime_dedicated_mileage()
             self._apply_runtime_disappearance_observations(observed)
         self._apply_deployment_observations(observed)
-        self._apply_entry_observations(observed)
+        self._apply_runtime_scan_observations(observed)
+        if not self._task_groups or observed.get("evaluate_entry_observation", True) is not False:
+            self._apply_entry_observations(observed)
         self._apply_handoff_observations(observed)
         self._apply_carrier_route_observations(observed)
         recovered_uuv_ids = self._apply_recovery_observations(observed)
@@ -2355,34 +2663,24 @@ class MissionController:
             self._apply_runtime_entry_observations(observations)
             return
         probabilities = _mapping(observations.get("entry_probability"))
-        predicted_exit_region_id = str(
-            observations.get("target_exit_predicted", "")
-        )
+        predicted_exit_region_id = str(observations.get("target_exit_predicted", ""))
         for region_id, region in tuple(self._regions.items()):
             if region.lifecycle is not RegionLifecycle.ACTIVE_SCAN:
                 continue
             if region_id == predicted_exit_region_id:
                 # An exit prediction in the same cycle takes precedence over
                 # entry confirmation for the active predecessor.
-                self._regions[region_id] = region.model_copy(
-                    update={"entry_confirmations": 0}
-                )
+                self._regions[region_id] = region.model_copy(update={"entry_confirmations": 0})
                 continue
             if region_id not in probabilities:
-                self._regions[region_id] = region.model_copy(
-                    update={"entry_confirmations": 0}
-                )
+                self._regions[region_id] = region.model_copy(update={"entry_confirmations": 0})
                 continue
             probability = _float(probabilities.get(region_id), float("nan"))
             if not isfinite(probability) or not 0.0 <= probability <= 1.0:
-                self._regions[region_id] = region.model_copy(
-                    update={"entry_confirmations": 0}
-                )
+                self._regions[region_id] = region.model_copy(update={"entry_confirmations": 0})
                 continue
             confirmations = (
-                region.entry_confirmations + 1
-                if probability >= self._entry_threshold
-                else 0
+                region.entry_confirmations + 1 if probability >= self._entry_threshold else 0
             )
             updated = region.model_copy(update={"entry_confirmations": confirmations})
             self._regions[region_id] = updated
@@ -2400,14 +2698,140 @@ class MissionController:
                     self._uuv_modes[uuv_id] = UUVMissionMode.PASSIVE_TRACK
             self._emit("target_entered_region", region_id)
 
+    def _apply_runtime_scan_observations(self, observations: Observation) -> None:
+        """Apply absolute source-backed scan evidence for the current generation."""
+
+        states = _mapping(observations.get("runtime_scan_states"))
+        for raw_region_id, raw_state in states.items():
+            region_id = str(raw_region_id)
+            region = self._regions.get(region_id)
+            state = _mapping(raw_state)
+            if region is None or not state:
+                continue
+            state_group_id = str(state.get("group_instance_id", ""))
+            replacement = self._replacement_states.get(region_id)
+            accepted_group_ids = {region.task_group_id}
+            if replacement is not None:
+                accepted_group_ids.add(replacement.incoming_group_id)
+            if state_group_id not in accepted_group_ids:
+                continue
+            coverage = _float(state.get("coverage"), float("nan"))
+            route_progress = _float(
+                state.get("route_progress"),
+                float("nan"),
+            )
+            scan_round = _int(state.get("scan_round"), -1)
+            ping_count = _int(state.get("ping_count"), -1)
+            if (
+                not isfinite(coverage)
+                or not 0.0 <= coverage <= 1.0
+                or not isfinite(route_progress)
+                or not 0.0 <= route_progress <= 1.0
+                or scan_round < 0
+                or ping_count < 0
+            ):
+                continue
+            state_evidence_ids = _strings(state.get("evidence_ids"))
+            replacement_incoming = (
+                replacement is not None and replacement.incoming_group_id == state_group_id
+            )
+            if replacement_incoming:
+                assert replacement is not None
+                if replacement.outgoing_group_id == self._tracking_control.tracking_owner_group_id:
+                    # Incoming scan evidence remains candidate-owned until the
+                    # handoff commits.  The public region still identifies the
+                    # outgoing owner, so publishing the incoming generation's
+                    # counters here would make the old group's progress regress.
+                    continue
+                if region.task_group_id != state_group_id and ping_count == 0:
+                    # A replacement candidate has not produced physical scan
+                    # evidence yet.  Keep the public region bound to the
+                    # outgoing generation and preserve its counters until the
+                    # incoming group owns an evidence-backed scan state.
+                    continue
+            if (
+                scan_round > region.scan_round
+                or (
+                    replacement_incoming
+                    and region.task_group_id != state_group_id
+                )
+            ):
+                next_round = scan_round
+                next_progress = route_progress
+                next_coverage = coverage
+                next_ping_count = ping_count
+                evidence_ids = tuple(dict.fromkeys(state_evidence_ids))[-256:]
+            elif scan_round == region.scan_round:
+                next_round = scan_round
+                next_progress = max(region.route_progress, route_progress)
+                next_coverage = max(region.coverage, coverage)
+                next_ping_count = max(region.ping_count, ping_count)
+                evidence_ids = tuple(
+                    dict.fromkeys((*region.scan_evidence_ids, *state_evidence_ids))
+                )[-256:]
+            else:
+                next_round = region.scan_round
+                next_progress = region.route_progress
+                next_coverage = region.coverage
+                next_ping_count = region.ping_count
+                evidence_ids = region.scan_evidence_ids
+            self._regions[region_id] = region.model_copy(
+                update={
+                    "coverage": next_coverage,
+                    "route_progress": next_progress,
+                    "scan_round": next_round,
+                    "ping_count": next_ping_count,
+                    "scan_completed": (next_coverage >= region.scan_completion_threshold),
+                    "scan_evidence_ids": evidence_ids,
+                }
+            )
+            if replacement_incoming and ping_count > 0:
+                assert replacement is not None
+                outgoing = self._task_groups.get(replacement.outgoing_group_id)
+                incoming = self._task_groups.get(replacement.incoming_group_id)
+                if (
+                    outgoing is not None
+                    and incoming is not None
+                    and outgoing.group_instance_id != self._tracking_control.tracking_owner_group_id
+                    and outgoing.lifecycle
+                    not in {
+                        TaskGroupLifecycle.EXITING,
+                        TaskGroupLifecycle.DISAPPEARED,
+                    }
+                    and incoming.lifecycle is TaskGroupLifecycle.ACTIVE_SCAN
+                ):
+                    active_ids, passive_ids = _runtime_region_assignments(incoming)
+                    self._regions[region_id] = self._regions[region_id].model_copy(
+                        update={
+                            "task_group_id": incoming.group_instance_id,
+                            "active_scan_uuv_ids": active_ids,
+                            "passive_track_uuv_ids": passive_ids,
+                            "lifecycle": RegionLifecycle.ACTIVE_SCAN,
+                        }
+                    )
+                    self._set_group_phase(
+                        outgoing.group_instance_id,
+                        TaskGroupLifecycle.EXITING,
+                        GroupSensorMode.PASSIVE,
+                    )
+                    self._emit(
+                        "task_group_exiting",
+                        outgoing.group_instance_id,
+                        {
+                            "replacement_group_instance_id": (incoming.group_instance_id),
+                            "boundary_region_id": outgoing.region_id,
+                            "evidence_ids": _strings(state.get("evidence_ids")),
+                        },
+                        dedupe_id=(f"task-group-exiting:{outgoing.group_instance_id}"),
+                    )
+
     def _apply_runtime_entry_observations(self, observations: Observation) -> None:
         raw_probabilities = observations.get("region_entry_probabilities")
         if raw_probabilities is None:
             raw_probabilities = observations.get("entry_probability")
         probabilities = _mapping(raw_probabilities)
-        predicted_exit_region_id = str(
-            observations.get("target_exit_predicted", "")
-        )
+        evidence_by_region = _mapping(observations.get("region_entry_evidence_ids"))
+        predicted_exit_region_id = str(observations.get("target_exit_predicted", ""))
         for region_id, region in tuple(self._regions.items()):
             group = next(
                 (
@@ -2420,23 +2844,70 @@ class MissionController:
             )
             if group is None:
                 continue
-            if region_id == predicted_exit_region_id or region_id not in probabilities:
+            if region_id == predicted_exit_region_id:
+                raw_probability = probabilities.get(region_id)
+                probability = _float(raw_probability, float("nan"))
                 self._regions[region_id] = region.model_copy(
-                    update={"entry_confirmations": 0}
+                    update={
+                        "entry_probability": (
+                            probability
+                            if isfinite(probability) and 0.0 <= probability <= 1.0
+                            else None
+                        ),
+                        "entry_confirmations": 0,
+                        "entry_confirmation_required": self._confirm_cycles,
+                        "entry_observation_cycle_s": self._sim_time_s,
+                        "entry_reset_reason": "simultaneous_exit",
+                        "entry_evidence_ids": _strings(evidence_by_region.get(region_id)),
+                    }
+                )
+                continue
+            if region_id not in probabilities:
+                self._regions[region_id] = region.model_copy(
+                    update={
+                        "entry_probability": None,
+                        "entry_confirmations": 0,
+                        "entry_confirmation_required": self._confirm_cycles,
+                        "entry_observation_cycle_s": self._sim_time_s,
+                        "entry_reset_reason": "missing_probability",
+                        "entry_evidence_ids": (),
+                    }
                 )
                 continue
             probability = _float(probabilities.get(region_id), float("nan"))
             if not isfinite(probability) or not 0.0 <= probability <= 1.0:
                 self._regions[region_id] = region.model_copy(
-                    update={"entry_confirmations": 0}
+                    update={
+                        "entry_probability": None,
+                        "entry_confirmations": 0,
+                        "entry_confirmation_required": self._confirm_cycles,
+                        "entry_observation_cycle_s": self._sim_time_s,
+                        "entry_reset_reason": "non_finite_probability",
+                        "entry_evidence_ids": _strings(evidence_by_region.get(region_id)),
+                    }
                 )
                 continue
-            confirmations = (
-                region.entry_confirmations + 1
-                if probability >= self._entry_threshold
-                else 0
+            if probability < self._entry_threshold:
+                confirmations = 0
+            elif region.entry_observation_cycle_s == self._sim_time_s:
+                confirmations = region.entry_confirmations
+            else:
+                confirmations = min(
+                    self._confirm_cycles,
+                    region.entry_confirmations + 1,
+                )
+            updated = region.model_copy(
+                update={
+                    "entry_probability": probability,
+                    "entry_confirmations": confirmations,
+                    "entry_confirmation_required": self._confirm_cycles,
+                    "entry_observation_cycle_s": self._sim_time_s,
+                    "entry_reset_reason": (
+                        None if probability >= self._entry_threshold else "below_threshold"
+                    ),
+                    "entry_evidence_ids": _strings(evidence_by_region.get(region_id)),
+                }
             )
-            updated = region.model_copy(update={"entry_confirmations": confirmations})
             self._regions[region_id] = updated
             if confirmations < self._confirm_cycles:
                 continue
@@ -2490,12 +2961,10 @@ class MissionController:
             ),
             key=lambda group: (group.region_id, group.group_instance_id),
         )
-        raw_passive = observations.get("passive_observer_ids")
-        raw_deployed = observations.get("deployed_uuv_ids")
+        raw_handoff_evidence = observations.get("handoff_evidence")
         for candidate in candidates:
-            if (
-                self._tracking_control.mode != "dedicated"
-                and not self._runtime_groups_are_adjacent(owner, candidate)
+            if self._tracking_control.mode != "dedicated" and not self._runtime_groups_are_adjacent(
+                owner, candidate
             ):
                 self._emit_handoff_waiting(
                     owner,
@@ -2503,31 +2972,148 @@ class MissionController:
                     reason="successor_not_adjacent",
                 )
                 continue
-            passive_ids = _runtime_observation_ids(raw_passive, candidate)
-            deployed_ids = _runtime_observation_ids(raw_deployed, candidate)
-            required = set(candidate.member_uuv_ids)
-            if required.issubset(passive_ids) and required.issubset(deployed_ids):
-                if self._transfer_tracking_owner(
-                    owner_id,
-                    candidate.group_instance_id,
-                    tuple(sorted(passive_ids & required)),
-                ):
-                    return
-            else:
-                self._emit_handoff_waiting(
+            evidence = self._runtime_handoff_evidence(
+                raw_handoff_evidence,
+                owner,
+                candidate,
+            )
+            if evidence is not None:
+                required = tuple(candidate.member_uuv_ids)
+                observing = {
+                    observation.observer_uuv_id for observation in evidence.accepted_observations
+                }
+                evidence_ids = tuple(
+                    observation.observation_id for observation in evidence.accepted_observations
+                )
+                blocked_reason = self._runtime_handoff_blocked_reason(
+                    evidence,
                     owner,
                     candidate,
-                    reason=(
-                        "passive_observers_incomplete"
-                        if not required.issubset(passive_ids)
-                        else "successor_not_deployed"
-                    ),
                 )
+                self._tracking_control = self._tracking_control.model_copy(
+                    update={
+                        "pending_successor_group_id": candidate.group_instance_id,
+                        "handoff_observation_cycle_s": (evidence.observation_cycle_s),
+                        "successor_required_uuv_ids": required,
+                        "successor_deployed_uuv_ids": tuple(
+                            member_id
+                            for member_id in required
+                            if member_id in evidence.deployed_uuv_ids
+                        ),
+                        "successor_healthy_uuv_ids": tuple(
+                            member_id
+                            for member_id in required
+                            if member_id in evidence.healthy_uuv_ids
+                        ),
+                        "successor_passive_uuv_ids": tuple(
+                            member_id
+                            for member_id in required
+                            if member_id in evidence.passive_mode_uuv_ids
+                        ),
+                        "successor_observing_uuv_ids": tuple(
+                            member_id for member_id in required if member_id in observing
+                        ),
+                        "successor_evidence_ids": evidence_ids,
+                        "handoff_blocked_reason": blocked_reason,
+                    }
+                )
+                if blocked_reason is None:
+                    if self._transfer_tracking_owner(
+                        owner_id,
+                        candidate.group_instance_id,
+                        evidence_ids,
+                    ):
+                        return
+                else:
+                    self._emit_handoff_waiting(
+                        owner,
+                        candidate,
+                        reason=blocked_reason,
+                    )
+                continue
+            reason = (
+                "handoff_evidence_missing"
+                if raw_handoff_evidence is None
+                else "handoff_evidence_invalid"
+            )
+            self._tracking_control = self._tracking_control.model_copy(
+                update={
+                    "pending_successor_group_id": candidate.group_instance_id,
+                    "handoff_observation_cycle_s": None,
+                    "successor_required_uuv_ids": candidate.member_uuv_ids,
+                    "successor_deployed_uuv_ids": (),
+                    "successor_healthy_uuv_ids": (),
+                    "successor_passive_uuv_ids": (),
+                    "successor_observing_uuv_ids": (),
+                    "successor_evidence_ids": (),
+                    "handoff_blocked_reason": reason,
+                }
+            )
+            self._emit_handoff_waiting(owner, candidate, reason=reason)
+            return
         if not candidates and (
-            observations.get("target_exit_predicted")
-            or self._tracking_control.mode == "dedicated"
+            observations.get("target_exit_predicted") or self._tracking_control.mode == "dedicated"
         ):
             self._emit_handoff_waiting(owner, None, reason="successor_missing")
+
+    def _runtime_handoff_evidence(
+        self,
+        raw_evidence: object,
+        owner: TaskGroupInstance,
+        candidate: TaskGroupInstance,
+    ) -> HandoffEvidence | None:
+        """Read the typed evidence addressed to one runtime owner/successor pair."""
+
+        selected = raw_evidence
+        if isinstance(raw_evidence, Mapping) and "predecessor_region_id" not in raw_evidence:
+            selected = raw_evidence.get(owner.region_id)
+        if selected is None:
+            return None
+        try:
+            evidence = (
+                selected
+                if isinstance(selected, HandoffEvidence)
+                else HandoffEvidence.model_validate(selected)
+            )
+        except (TypeError, ValueError):
+            return None
+        if evidence.successor_region_id != candidate.region_id:
+            return evidence
+        return evidence
+
+    def _runtime_handoff_blocked_reason(
+        self,
+        evidence: HandoffEvidence,
+        owner: TaskGroupInstance,
+        candidate: TaskGroupInstance,
+    ) -> str | None:
+        """Return the first failed 3/3 takeover guard, otherwise ``None``."""
+
+        required = set(candidate.member_uuv_ids)
+        observing = {observation.observer_uuv_id for observation in evidence.accepted_observations}
+        if evidence.predecessor_region_id != owner.region_id:
+            return "handoff_predecessor_mismatch"
+        if evidence.successor_region_id != candidate.region_id:
+            return "handoff_successor_mismatch"
+        if evidence.plan_revision != self._plan_revision:
+            return "handoff_revision_mismatch"
+        if evidence.observation_cycle_s != self._sim_time_s:
+            return "handoff_observation_cycle_stale"
+        if required != set(evidence.required_uuv_ids) or len(required) != 3:
+            return "successor_required_members_mismatch"
+        if evidence.blocked_reason is not None:
+            return evidence.blocked_reason
+        if evidence.hard_guard_reasons:
+            return "successor_hard_guard_failed"
+        if not required.issubset(evidence.deployed_uuv_ids):
+            return "successor_deployment_incomplete"
+        if not required.issubset(evidence.healthy_uuv_ids):
+            return "successor_health_incomplete"
+        if not required.issubset(evidence.passive_mode_uuv_ids):
+            return "successor_passive_mode_incomplete"
+        if not required.issubset(observing):
+            return "successor_current_cycle_observations_incomplete"
+        return None
 
     def _runtime_groups_are_adjacent(
         self,
@@ -2542,9 +3128,7 @@ class MissionController:
             successor_region_id = owner_region.successor_region_id
         else:
             mission_region = self._regions.get(owner.region_id)
-            successor_region_id = (
-                mission_region.handoff_to if mission_region is not None else None
-            )
+            successor_region_id = mission_region.handoff_to if mission_region is not None else None
         if candidate_region is not None:
             predecessor_region_id = candidate_region.predecessor_region_id
         else:
@@ -2555,6 +3139,7 @@ class MissionController:
         return (
             successor_region_id == candidate.region_id
             or predecessor_region_id == owner.region_id
+            or candidate.source_group_instance_id == owner.group_instance_id
         )
 
     def _emit_handoff_waiting(
@@ -2570,25 +3155,24 @@ class MissionController:
             else None
         )
         pending_successor_id = (
-            candidate.group_instance_id
-            if candidate is not None
-            else retained_pending_id
+            candidate.group_instance_id if candidate is not None else retained_pending_id
         )
         if (
-            self._tracking_control.pending_successor_group_id
-            != pending_successor_id
+            self._tracking_control.pending_successor_group_id != pending_successor_id
+            or self._tracking_control.handoff_blocked_reason != reason
         ):
             self._tracking_control = self._tracking_control.model_copy(
-                update={"pending_successor_group_id": pending_successor_id}
+                update={
+                    "pending_successor_group_id": pending_successor_id,
+                    "handoff_blocked_reason": reason,
+                }
             )
         self._emit(
             "handoff_waiting_for_passive_observation",
             owner.group_instance_id,
             {
                 "owner_group_instance_id": owner.group_instance_id,
-                "successor_group_instance_id": (
-                    pending_successor_id
-                ),
+                "successor_group_instance_id": (pending_successor_id),
                 "reason": reason,
             },
             dedupe_id=(
@@ -2608,10 +3192,7 @@ class MissionController:
             evidence_items = (raw_evidence,)
         elif isinstance(raw_evidence, Mapping):
             evidence_items = tuple(
-                value
-                for _, value in sorted(
-                    raw_evidence.items(), key=lambda item: str(item[0])
-                )
+                value for _, value in sorted(raw_evidence.items(), key=lambda item: str(item[0]))
             )
         elif isinstance(raw_evidence, Sequence) and not isinstance(
             raw_evidence, (str, bytes, bytearray)
@@ -2645,13 +3226,16 @@ class MissionController:
                 continue
             active_exit = (
                 predecessor.lifecycle is RegionLifecycle.ACTIVE_SCAN
-                and str(observations.get("target_exit_predicted", ""))
-                == predecessor_id
+                and str(observations.get("target_exit_predicted", "")) == predecessor_id
             )
-            if predecessor.lifecycle not in {
-                RegionLifecycle.PASSIVE_TRACK,
-                RegionLifecycle.HANDOFF_PENDING,
-            } and not active_exit:
+            if (
+                predecessor.lifecycle
+                not in {
+                    RegionLifecycle.PASSIVE_TRACK,
+                    RegionLifecycle.HANDOFF_PENDING,
+                }
+                and not active_exit
+            ):
                 continue
             if successor.lifecycle not in {
                 RegionLifecycle.PLANNED,
@@ -2708,8 +3292,7 @@ class MissionController:
                     "successor_uuv_ids": tuple(sorted(required)),
                     "plan_revision": evidence.plan_revision,
                     "source_observation_ids": tuple(
-                        observation.observation_id
-                        for observation in evidence.accepted_observations
+                        observation.observation_id for observation in evidence.accepted_observations
                     ),
                 },
                 dedupe_id=f"handoff:r{evidence.plan_revision}:{successor_id}",
@@ -2736,11 +3319,7 @@ class MissionController:
         current = self._regions[predecessor_id]
         if reason not in current.degraded_reasons:
             self._regions[predecessor_id] = current.model_copy(
-                update={
-                    "degraded_reasons": tuple(
-                        sorted({*current.degraded_reasons, reason})
-                    )
-                }
+                update={"degraded_reasons": tuple(sorted({*current.degraded_reasons, reason}))}
             )
         # A typed blocker with accepted successor observations has enough
         # evidence to rotate the predecessor.  A legacy/no-observation
@@ -2761,8 +3340,7 @@ class MissionController:
                 "plan_revision": evidence.plan_revision,
                 "reason": reason,
                 "source_observation_ids": tuple(
-                    observation.observation_id
-                    for observation in evidence.accepted_observations
+                    observation.observation_id for observation in evidence.accepted_observations
                 ),
             },
             dedupe_id=f"handoff-blocked:r{evidence.plan_revision}:{successor_id}:{reason}",
@@ -2834,9 +3412,7 @@ class MissionController:
                     "ready_uuv_ids": tuple(sorted({*carrier.ready_uuv_ids, uuv_id})),
                 }
             )
-            self._resource_episode_by_uuv[uuv_id] = (
-                self._resource_episode_by_uuv.get(uuv_id, 0) + 1
-            )
+            self._resource_episode_by_uuv[uuv_id] = self._resource_episode_by_uuv.get(uuv_id, 0) + 1
             previous_resource = self._uuv_resources.get(uuv_id)
             self._uuv_resources[uuv_id] = UUVResourceState(
                 uuv_id=uuv_id,
@@ -2845,9 +3421,7 @@ class MissionController:
                 energy_fraction=1.0,
                 healthy=True,
                 capability_active=(
-                    previous_resource.capability_active
-                    if previous_resource is not None
-                    else True
+                    previous_resource.capability_active if previous_resource is not None else True
                 ),
                 deployment_state=UUVMissionMode.ONBOARD.value,
                 resource_episode=self._resource_episode_by_uuv[uuv_id],
@@ -2951,15 +3525,11 @@ class MissionController:
                 mileage_m=previous.mileage_m if previous is not None else 0.0,
                 energy_fraction=previous.energy_fraction if previous is not None else 0.0,
                 healthy=previous.healthy if previous is not None else True,
-                capability_active=(
-                    previous.capability_active if previous is not None else True
-                ),
+                capability_active=(previous.capability_active if previous is not None else True),
                 deployment_state="unavailable",
                 resource_episode=self._resource_episode_by_uuv.get(uuv_id, 0),
             )
-            self._unavailable_until_by_uuv[uuv_id] = (
-                self._sim_time_s + self._refuel_cooldown_s
-            )
+            self._unavailable_until_by_uuv[uuv_id] = self._sim_time_s + self._refuel_cooldown_s
             exited_uuv_ids.add(uuv_id)
             self._emit("uuv_boundary_exit_completed", uuv_id)
         return exited_uuv_ids
@@ -2971,9 +3541,7 @@ class MissionController:
             self._unavailable_until_by_uuv.pop(uuv_id, None)
             self._uuv_modes[uuv_id] = UUVMissionMode.ONBOARD
             self._restore_normal_mode(uuv_id)
-            self._resource_episode_by_uuv[uuv_id] = (
-                self._resource_episode_by_uuv.get(uuv_id, 0) + 1
-            )
+            self._resource_episode_by_uuv[uuv_id] = self._resource_episode_by_uuv.get(uuv_id, 0) + 1
             previous = self._uuv_resources.get(uuv_id)
             self._uuv_resources[uuv_id] = UUVResourceState(
                 uuv_id=uuv_id,
@@ -2981,9 +3549,7 @@ class MissionController:
                 mileage_m=0.0,
                 energy_fraction=1.0,
                 healthy=True,
-                capability_active=(
-                    previous.capability_active if previous is not None else True
-                ),
+                capability_active=(previous.capability_active if previous is not None else True),
                 deployment_state=self._uuv_modes[uuv_id].value,
                 resource_episode=self._resource_episode_by_uuv[uuv_id],
             )
@@ -3055,8 +3621,7 @@ class MissionController:
                 self._return_uuv(uuv_id, "uuv_range_exhausted")
             elif (
                 self._uuv_is_regional_worker(uuv_id)
-                and self._max_mileage_m - mileage_value
-                <= self.resource_warning_mileage_m
+                and self._max_mileage_m - mileage_value <= self.resource_warning_mileage_m
             ):
                 self._return_uuv(uuv_id, "uuv_range_reserve")
             elif energy_value <= self._min_energy_fraction:
@@ -3085,7 +3650,8 @@ class MissionController:
 
     def _uuv_is_regional_worker(self, uuv_id: str) -> bool:
         return any(
-            uuv_id in {
+            uuv_id
+            in {
                 *region.active_scan_uuv_ids,
                 *region.passive_track_uuv_ids,
             }
@@ -3107,11 +3673,7 @@ class MissionController:
         )
         if region is None or region.lifecycle is RegionLifecycle.TRACKING_COMPLETED:
             return False
-        role = (
-            "active_scan"
-            if outgoing_uuv_id in region.active_scan_uuv_ids
-            else "passive_track"
-        )
+        role = "active_scan" if outgoing_uuv_id in region.active_scan_uuv_ids else "passive_track"
         assigned_elsewhere = {
             uuv_id
             for candidate in self._regions.values()
@@ -3123,9 +3685,7 @@ class MissionController:
             )
         }
         candidates = tuple(region.reserve_uuv_ids) + tuple(
-            uuv_id
-            for uuv_id in sorted(self._uuv_modes)
-            if uuv_id not in region.reserve_uuv_ids
+            uuv_id for uuv_id in sorted(self._uuv_modes) if uuv_id not in region.reserve_uuv_ids
         )
         replacement_uuv_id = next(
             (
@@ -3162,17 +3722,13 @@ class MissionController:
                 "active_scan_uuv_ids": active_ids,
                 "passive_track_uuv_ids": passive_ids,
                 "reserve_uuv_ids": tuple(
-                    item
-                    for item in region.reserve_uuv_ids
-                    if item != replacement_uuv_id
+                    item for item in region.reserve_uuv_ids if item != replacement_uuv_id
                 ),
                 "scan_waypoints_by_uuv": routes,
             }
         )
         replacement_mode = (
-            UUVMissionMode.ACTIVE_SCAN
-            if role == "active_scan"
-            else UUVMissionMode.PASSIVE_TRACK
+            UUVMissionMode.ACTIVE_SCAN if role == "active_scan" else UUVMissionMode.PASSIVE_TRACK
         )
         self._uuv_modes[replacement_uuv_id] = replacement_mode
         replacement_resource = self._uuv_resources.get(replacement_uuv_id)
@@ -3242,9 +3798,7 @@ class MissionController:
                     "reserved_uuv_ids": tuple(
                         item for item in carrier.reserved_uuv_ids if item != uuv_id
                     ),
-                    "recoverable_uuv_ids": tuple(
-                        sorted({*carrier.recoverable_uuv_ids, uuv_id})
-                    ),
+                    "recoverable_uuv_ids": tuple(sorted({*carrier.recoverable_uuv_ids, uuv_id})),
                 }
             )
             self._carrier_missions[carrier_id] = updated
@@ -3275,8 +3829,12 @@ class MissionController:
         self._carrier_missions[carrier_id] = carrier.model_copy(
             update={
                 "ready_uuv_ids": tuple(item for item in carrier.ready_uuv_ids if item != uuv_id),
-                "onboard_uuv_ids": tuple(item for item in carrier.onboard_uuv_ids if item != uuv_id),
-                "reserved_uuv_ids": tuple(item for item in carrier.reserved_uuv_ids if item != uuv_id),
+                "onboard_uuv_ids": tuple(
+                    item for item in carrier.onboard_uuv_ids if item != uuv_id
+                ),
+                "reserved_uuv_ids": tuple(
+                    item for item in carrier.reserved_uuv_ids if item != uuv_id
+                ),
                 "recoverable_uuv_ids": tuple(sorted({*carrier.recoverable_uuv_ids, uuv_id})),
             }
         )
@@ -3303,8 +3861,12 @@ class MissionController:
         self._carrier_missions[carrier_id] = carrier.model_copy(
             update={
                 "ready_uuv_ids": tuple(item for item in carrier.ready_uuv_ids if item != uuv_id),
-                "onboard_uuv_ids": tuple(item for item in carrier.onboard_uuv_ids if item != uuv_id),
-                "reserved_uuv_ids": tuple(item for item in carrier.reserved_uuv_ids if item != uuv_id),
+                "onboard_uuv_ids": tuple(
+                    item for item in carrier.onboard_uuv_ids if item != uuv_id
+                ),
+                "reserved_uuv_ids": tuple(
+                    item for item in carrier.reserved_uuv_ids if item != uuv_id
+                ),
             }
         )
 
@@ -3392,8 +3954,7 @@ class MissionController:
             region = self._regions.get(region_id)
             if (
                 not self._task_groups
-                and
-                region is not None
+                and region is not None
                 and region.lifecycle is RegionLifecycle.PASSIVE_TRACK
                 and region.handoff_to is not None
             ):
@@ -3429,9 +3990,7 @@ class MissionController:
     def _apply_carrier_route_observations(self, observations: Observation) -> None:
         statuses = _mapping(observations.get("carrier_route_status"))
         epochs = _mapping(observations.get("carrier_route_epoch"))
-        for raw_carrier_id, raw_status in sorted(
-            statuses.items(), key=lambda item: str(item[0])
-        ):
+        for raw_carrier_id, raw_status in sorted(statuses.items(), key=lambda item: str(item[0])):
             carrier_id = str(raw_carrier_id)
             mission = self._carrier_missions.get(carrier_id)
             if mission is None:
@@ -3448,19 +4007,13 @@ class MissionController:
                 continue
             if mission.route_status is status:
                 continue
-            self._carrier_missions[carrier_id] = mission.model_copy(
-                update={"route_status": status}
-            )
+            self._carrier_missions[carrier_id] = mission.model_copy(update={"route_status": status})
             if status is CarrierRouteStatus.COMPLETE:
                 self._emit(
                     "carrier_returned_to_fleet",
                     carrier_id,
                     {"role": mission.role},
-                    dedupe_id=(
-                        None
-                        if epoch_value is None
-                        else f"route:{epoch_value}"
-                    ),
+                    dedupe_id=(None if epoch_value is None else f"route:{epoch_value}"),
                 )
 
     def _transition(self, region_id: str, next_state: RegionLifecycle) -> None:
@@ -3468,9 +4021,7 @@ class MissionController:
         if current is next_state:
             return
         if not validate_region_transition(current, next_state):
-            raise ValueError(
-                f"invalid region transition {current.value}->{next_state.value}"
-            )
+            raise ValueError(f"invalid region transition {current.value}->{next_state.value}")
         self._regions[region_id] = self._regions[region_id].model_copy(
             update={"lifecycle": next_state}
         )
@@ -3524,11 +4075,7 @@ class MissionController:
     ) -> int:
         data = payload or {}
         explicit = data.get("deployment_revision")
-        if (
-            isinstance(explicit, int)
-            and not isinstance(explicit, bool)
-            and explicit >= 1
-        ):
+        if isinstance(explicit, int) and not isinstance(explicit, bool) and explicit >= 1:
             return explicit
         candidates = (
             entity_id,
@@ -3605,9 +4152,7 @@ class MissionController:
         )
         data.setdefault(
             "member_uuv_ids",
-            group.member_uuv_ids
-            if group is not None
-            else tuple(data.get("uuv_ids", ())),
+            group.member_uuv_ids if group is not None else tuple(data.get("uuv_ids", ())),
         )
         data.setdefault(
             "deployment_revision",
@@ -3625,11 +4170,7 @@ class MissionController:
         data.setdefault("reason", event_type)
         data.setdefault(
             "source_event_ids",
-            tuple(
-                dict.fromkeys(
-                    (*self._tracking_control.source_event_ids, event_id)
-                )
-            ),
+            tuple(dict.fromkeys((*self._tracking_control.source_event_ids, event_id))),
         )
         return data
 
@@ -3733,5 +4274,19 @@ def _float(value: object, default: float) -> float:
         if not isinstance(value, (int, float, str)):
             return default
         return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _int(value: object, default: int) -> int:
+    try:
+        if value is None or isinstance(value, bool):
+            return default
+        if not isinstance(value, (int, float, str)):
+            return default
+        converted = float(value)
+        if not isfinite(converted) or not converted.is_integer():
+            return default
+        return int(converted)
     except (TypeError, ValueError):
         return default
