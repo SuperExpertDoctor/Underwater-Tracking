@@ -34,6 +34,7 @@ from underwater_tracking.agent.state import CarrierState
 from underwater_tracking.domain.agent_models import ExpertDirective
 from underwater_tracking.domain.availability import deployability_conflict, is_deployable
 from underwater_tracking.domain.models import SituationSnapshot
+from underwater_tracking.domain.public_payload import sanitize_public_mapping
 from underwater_tracking.persistence.ledger import DecisionLedger
 
 # The directive parsing operation key (spec 22).
@@ -66,7 +67,7 @@ def directive_preview_diff(directive: ExpertDirective) -> dict[str, object]:
     Conversation rendering uses this helper instead of exposing the full
     planning snapshot or any LLM reasoning to the browser.
     """
-    return {
+    return sanitize_public_mapping({
         "target_scope": list(directive.target_scope),
         "target_priorities": dict(directive.target_priorities),
         "minimum_quality": dict(directive.minimum_quality),
@@ -77,7 +78,7 @@ def directive_preview_diff(directive: ExpertDirective) -> dict[str, object]:
         "return_uuv_ids": list(directive.return_uuv_ids),
         "tracking_mode": directive.tracking_mode,
         "dedicated_uuv_ids": list(directive.dedicated_uuv_ids),
-    }
+    })
 
 
 class _DirectiveState(CarrierState, total=False):

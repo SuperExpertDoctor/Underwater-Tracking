@@ -54,6 +54,7 @@ from underwater_tracking.domain.agent_models import (
     ValidationIssue,
     ValidationReport,
 )
+from underwater_tracking.domain.public_payload import sanitize_public_mapping
 from underwater_tracking.domain.regional_models import RegionTask
 from underwater_tracking.planning.regional_validation import validate_regional_plan
 
@@ -410,11 +411,11 @@ class RepairNode:
             # provider call cannot be replaced by the previous candidate.
             raise
         attempt = state.get("attempt", 0) + 1
-        return {
+        return sanitize_public_mapping({
             "candidate": repaired,
             "attempt": attempt,
             "repair_attempts": attempt,
-        }
+        })
 
     def build_payload(
         self,

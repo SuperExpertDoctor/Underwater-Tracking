@@ -20,6 +20,13 @@ event_cooldown_s: 300
 # Token estimate that triggers History compaction (spec 9).
 history_token_threshold: 6000
 
+# Authoritative execution snapshots are refreshed before their deadline. A
+# source gap cannot extend an already expired snapshot.
+execution_refresh:
+  validity_s: 450
+  margin_s: 120
+  retry_interval_s: 30
+
 # Runtime state limits keep long-running simulations bounded. Durable event
 # logs remain complete; these values only limit in-process working sets.
 retention:

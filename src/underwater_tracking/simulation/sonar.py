@@ -145,6 +145,7 @@ def make_passive_observation(
         variance_rad2=observer.capability.passive_bearing_variance_rad2,
         detection_confidence=confidence,
         snr_db=snr_db,
+        observer_position_xy=observer.position_xy,
     )
 
 

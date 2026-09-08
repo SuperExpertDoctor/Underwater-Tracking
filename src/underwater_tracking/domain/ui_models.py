@@ -47,6 +47,7 @@ from underwater_tracking.domain.relationships import (
     normalize_legacy_carrier_relationships,
     normalize_legacy_uuv_deployment_state,
 )
+from underwater_tracking.domain.public_payload import sanitize_public_payload
 from underwater_tracking.domain.truth import TargetTruth
 
 
@@ -55,6 +56,23 @@ OperationalStage = Literal[
     "event_trigger",
     "human_feedback",
     "dynamic_adjustment",
+]
+
+ExecutionRefreshStatus = Literal[
+    "idle",
+    "due",
+    "generating",
+    "committed",
+    "waiting_for_source",
+    "rejected",
+    "recovering",
+]
+ExecutionRefreshResult = Literal[
+    "unknown",
+    "committed",
+    "rejected",
+    "waiting_for_source",
+    "recovered",
 ]
 
 
@@ -407,7 +425,7 @@ class PredictionHealthView(StrictModel):
         "legacy_unknown",
     ]
     reason_codes: tuple[str, ...] = ()
-    source_track_age_s: float = Field(ge=0, allow_inf_nan=False)
+    source_track_age_s: float | None = Field(ge=0, allow_inf_nan=False)
     clipped_point_fraction: float = Field(ge=0, le=1, allow_inf_nan=False)
     maximum_radius_m: float = Field(ge=0, allow_inf_nan=False)
     raw_prediction_id: str | None = None
@@ -418,6 +436,10 @@ class PredictionCorridorView(StrictModel):
 
     prediction_id: str = Field(min_length=1)
     prediction_revision: int = Field(ge=1)
+    source_track_revision: int | None = None
+    last_observed_at_s: float | None = None
+    generated_at_s: float | None = None
+    valid_until_s: float | None = None
     origin_sim_time_s: float = Field(ge=0, allow_inf_nan=False)
     health: PredictionHealthView
     horizon_s: float = Field(gt=0)
@@ -456,6 +478,7 @@ class WorldModelEvidenceView(StrictModel):
         "uuv_projection",
         "map_bounds",
         "observability",
+        "short_history", "boundary_recovery", "task_region",
     ]
     value: float = Field(allow_inf_nan=False)
     threshold: float | None = Field(default=None, allow_inf_nan=False)
@@ -464,6 +487,18 @@ class WorldModelEvidenceView(StrictModel):
 
 
 class WorldModelEventView(StrictModel):
+    source_track_revision: int | None = None
+    prediction_revision: int | None = None
+    source_prediction_id: str | None = None
+    source_plan_revision: int | None = None
+    generated_at_s: float | None = None
+    last_observed_at_s: float | None = None
+    valid_until_s: float | None = None
+    owner_group_id: str | None = None
+    region_id: str | None = None
+    region_geometry_revision: int | None = None
+    source_group_id: str | None = None
+    control_authority: Literal[False] = False
     event_id: str
     event_type: str
     horizon: Literal["H1", "H2", "H3", "H4"]
@@ -486,6 +521,15 @@ class WorldModelHorizonView(StrictModel):
 
 
 class WorldModelForecastView(StrictModel):
+    source_track_revision: int | None = None
+    prediction_revision: int | None = None
+    generated_at_s: float | None = None
+    last_observed_at_s: float | None = None
+    valid_until_s: float | None = None
+    owner_group_id: str | None = None
+    region_id: str | None = None
+    region_geometry_revision: int | None = None
+    source_group_id: str | None = None
     model_kind: Literal["rule_demo"] = "rule_demo"
     model_version: str
     control_authority: Literal[False] = False
@@ -494,7 +538,7 @@ class WorldModelForecastView(StrictModel):
     source_observation_ids: tuple[str, ...] = ()
     source_observability_event_ids: tuple[str, ...] = ()
     source_plan_revision: int | None = Field(default=None, ge=1)
-    data_status: Literal["ready", "degraded"]
+    data_status: Literal["ready", "degraded", "expired", "unavailable"]
     trajectory_fallback_used: bool
     imm_model_probabilities: dict[str, float] = Field(default_factory=dict)
     horizons: tuple[WorldModelHorizonView, ...] = ()
@@ -505,16 +549,40 @@ class WorldModelForecastView(StrictModel):
 class EstimateQualityView(StrictModel):
     """Estimator-visible quality proxies; never true error."""
 
-    quality_score: float = Field(ge=0, le=1)
-    estimated_rmse_m: float = Field(ge=0)
-    fim_min_eigenvalue: float = Field(ge=0)
-    fim_condition: float = Field(ge=0)
+    quality_score: float | None = Field(default=None, ge=0, le=1)
+    estimated_rmse_m: float | None = Field(default=None, ge=0)
+    fim_min_eigenvalue: float | None = Field(default=None, ge=0)
+    fim_condition: float | None = Field(default=None, ge=0)
+
+
+class TargetEstimateFreshnessView(StrictModel):
+    """Source-backed age and validity of the public target estimate."""
+
+    status: Literal[
+        "live", "current", "stale", "degraded", "expired", "unavailable", "failed", "unknown"
+    ]
+    estimate_time_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    valid_until_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    data_age_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    track_revision: int | None = Field(default=None, ge=1)
+    source_observation_ids: tuple[str, ...] = ()
+    reason: str | None = None
 
 
 class TargetEstimateView(StrictModel):
     target_id: str
     mean: Point2D
-    covariance_ellipse: CovarianceEllipse
+    covariance_ellipse: CovarianceEllipse | None
+    estimate_health: dict[str, object] = Field(default_factory=dict)
+    estimate_freshness: TargetEstimateFreshnessView | None = None
+    estimate_time_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    valid_until_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    data_age_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    track_revision: int | None = Field(default=None, ge=1)
+    source_observation_ids: tuple[str, ...] = ()
+    estimate_health_status: Literal[
+        "live", "current", "stale", "degraded", "expired", "unavailable", "failed", "unknown"
+    ] | None = None
     intent: IntentView
     prediction: PredictionCorridorView | None = None
     world_model: WorldModelForecastView | None = None
@@ -596,6 +664,8 @@ class RegionTaskView(StrictModel):
     evidence_ids: tuple[str, ...] = ()
     revision: int = Field(default=1, ge=1)
     effect: TrackingEffectView
+    scan_telemetry: ScanTelemetryView | None = None
+    handoff_evidence: HandoffEvidenceView | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -764,6 +834,53 @@ class ExecutionGroupView(StrictModel):
     mode: Literal["active_scan", "passive_track", "returning"]
 
 
+class ScanTelemetryView(StrictModel):
+    """Current source-backed active-sonar scan telemetry for one region."""
+
+    route_progress: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    scan_round: int | None = Field(default=None, ge=0)
+    active_coverage_ratio: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    source_backed_ping_count: int | None = Field(default=None, ge=0)
+    active_ping_count: int | None = Field(default=None, ge=0)
+    scan_completed: bool | None = None
+    scan_completion_threshold: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    evidence_ids: tuple[str, ...] = ()
+
+
+class RegionEntryEvidenceView(StrictModel):
+    """Backend entry confirmation state and its source evidence."""
+
+    probability: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    confirmation_count: int | None = Field(default=None, ge=0)
+    required_cycles: int | None = Field(default=None, ge=1)
+    status: Literal["pending", "confirmed", "blocked", "unavailable"] = "unavailable"
+    blocking_reasons: tuple[str, ...] = ()
+    evidence_ids: tuple[str, ...] = ()
+    source_track_revision: int | None = Field(default=None, ge=1)
+    source_observation_ids: tuple[str, ...] = ()
+
+
+class HandoffEvidenceView(StrictModel):
+    """Current-cycle successor evidence used by the ownership gate."""
+
+    predecessor_group_id: str | None = None
+    successor_group_id: str | None = None
+    successor_region_id: str | None = None
+    observation_cycle_s: int | None = Field(default=None, ge=0)
+    required_uuv_ids: tuple[str, ...] = ()
+    valid_observation_uuv_ids: tuple[str, ...] = ()
+    status: Literal["pending", "ready", "completed", "blocked", "unavailable"] = "unavailable"
+    blocking_reasons: tuple[str, ...] = ()
+    evidence_ids: tuple[str, ...] = ()
+
+
+class BlockingReasonView(StrictModel):
+    code: str = Field(min_length=1)
+    message: str | None = None
+    scope: str | None = None
+    evidence_ids: tuple[str, ...] = ()
+
+
 class ExecutionRegionView(StrictModel):
     """One stable executable region projected from the authoritative snapshot."""
 
@@ -795,6 +912,25 @@ class ExecutionRegionView(StrictModel):
     ] = "planned"
     task_group_id: str | None = None
     evidence_ids: tuple[str, ...] = Field(min_length=1)
+    scan_telemetry: ScanTelemetryView | None = None
+    entry_probability: float | None = Field(default=None, ge=0, le=1)
+    entry_confirmations: int = Field(default=0, ge=0)
+    entry_confirmation_required: int = Field(default=2, ge=1)
+    entry_observation_cycle_s: int | None = Field(default=None, ge=0)
+    entry_reset_reason: Literal[
+        "missing_probability",
+        "non_finite_probability",
+        "below_threshold",
+        "simultaneous_exit",
+    ] | None = None
+    entry_evidence_ids: tuple[str, ...] = ()
+    coverage: float = Field(default=0.0, ge=0, le=1)
+    route_progress: float = Field(default=0.0, ge=0, le=1)
+    scan_round: int = Field(default=0, ge=0)
+    ping_count: int = Field(default=0, ge=0)
+    scan_completion_threshold: float = Field(default=0.95, gt=0, le=1)
+    scan_completed: bool = False
+    scan_evidence_ids: tuple[str, ...] = ()
 
     @model_validator(mode="before")
     @classmethod
@@ -830,6 +966,7 @@ class TrackingPolicyView(StrictModel):
     uuv_passive_detection_radius_m: float = Field(gt=0)
     region_entry_probability_threshold: float = Field(gt=0, le=1)
     region_transition_confirm_cycles: int = Field(ge=1)
+    scan_completion_threshold: float = Field(default=0.80, ge=0, le=1)
     max_uuv_mileage_m: float = Field(gt=0)
     dedicated_release_remaining_mileage_m: float = Field(gt=0)
 
@@ -856,6 +993,14 @@ class TrackingControlView(StrictModel):
     dedicated_release_triggered_at_m: float | None = Field(default=None, ge=0)
     dedicated_release_reason: str | None = None
     source_event_ids: tuple[str, ...] = ()
+    handoff_observation_cycle_s: int | None = Field(default=None, ge=0)
+    successor_required_uuv_ids: tuple[str, ...] = ()
+    successor_deployed_uuv_ids: tuple[str, ...] = ()
+    successor_healthy_uuv_ids: tuple[str, ...] = ()
+    successor_passive_uuv_ids: tuple[str, ...] = ()
+    successor_observing_uuv_ids: tuple[str, ...] = ()
+    successor_evidence_ids: tuple[str, ...] = ()
+    handoff_blocked_reason: str | None = None
 
 
 class RegionReplacementView(StrictModel):
@@ -867,6 +1012,26 @@ class RegionReplacementView(StrictModel):
     outgoing_group_id: str = Field(min_length=1)
     incoming_group_id: str = Field(min_length=1)
     latest_pending_geometry_revision: int | None = Field(default=None, ge=1)
+    batch_id: str | None = None
+    outgoing_lifecycle: Literal[
+        "entering",
+        "active_scan",
+        "passive_track",
+        "dedicated_track",
+        "dedicated_release_pending",
+        "exiting",
+        "disappeared",
+    ]
+    incoming_lifecycle: Literal[
+        "entering",
+        "active_scan",
+        "passive_track",
+        "dedicated_track",
+        "dedicated_release_pending",
+        "exiting",
+        "disappeared",
+    ]
+    evidence_ids: tuple[str, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
     def validate_replacement(self) -> RegionReplacementView:
@@ -906,6 +1071,8 @@ class TaskGroupInstanceView(StrictModel):
     source_group_instance_id: str | None = None
     reason: str = Field(min_length=1)
     evidence_ids: tuple[str, ...] = Field(min_length=1)
+    deployed_member_uuv_ids: tuple[str, ...] | None = None
+    passive_observation_uuv_ids: tuple[str, ...] | None = None
 
     @model_validator(mode="after")
     def validate_instance(self) -> TaskGroupInstanceView:
@@ -959,9 +1126,25 @@ class ExecutionView(StrictModel):
     tracking_policy: TrackingPolicyView
     tracking_control: TrackingControlView
     replacements: tuple[RegionReplacementView, ...] = ()
+    region_entry_probabilities: dict[str, float | None] = Field(default_factory=dict)
+    entry_confirmation_counts: dict[str, int | None] = Field(default_factory=dict)
+    entry_confirmation_required_cycles: int | None = Field(default=None, ge=1)
+    entry_blocking_reasons: dict[str, tuple[str, ...]] = Field(default_factory=dict)
+    region_entry_evidence: dict[str, RegionEntryEvidenceView] = Field(default_factory=dict)
+    handoff_evidence: HandoffEvidenceView | None = None
+    blocking_reasons: tuple[BlockingReasonView, ...] = ()
     degraded: bool = False
     degradation_reasons: tuple[str, ...] = ()
     active_plan_preserved: bool = False
+    refresh_status: ExecutionRefreshStatus = "idle"
+    refresh_attempt_id: str | None = None
+    refresh_due_at_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    refresh_last_attempt_s: float | None = Field(
+        default=None, ge=0, allow_inf_nan=False
+    )
+    refresh_last_result: ExecutionRefreshResult = "unknown"
+    refresh_reason_codes: tuple[str, ...] = Field(default=(), max_length=16)
+    refresh_source_snapshot_revision: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def validate_consistency(self) -> ExecutionView:
@@ -1015,20 +1198,16 @@ class ExecutionView(StrictModel):
                             "dedicated restore pair cannot contain a terminal incoming group"
                         )
                     continue
-                exiting = [
-                    group for group in region_groups if group.lifecycle == "exiting"
-                ]
+                slot_ids = {group.group_instance_id for group in region_groups}
                 incoming = [
-                    group for group in region_groups if group.lifecycle != "exiting"
+                    group
+                    for group in region_groups
+                    if group.source_group_instance_id in slot_ids
                 ]
-                if (
-                    len(exiting) != 1
-                    or len(incoming) != 1
-                    or incoming[0].lifecycle == "disappeared"
-                ):
+                if len(incoming) != 1 or incoming[0].lifecycle == "disappeared":
                     raise ValueError(
-                        "execution replacement pair requires one exiting outgoing "
-                        "and one current non-exiting incoming group"
+                        "execution replacement pair requires one source-linked "
+                        "current incoming group"
                     )
         group_regions = {group.region_id for group in self.task_groups}
         if self.tracking_control.mode == "regional" and group_regions != set(region_ids):
@@ -1044,12 +1223,20 @@ class ExecutionView(StrictModel):
                 for group in self.task_groups
                 if group.group_instance_id not in linked_group_ids
             )
+            replacement_source_ids = {
+                group.source_group_instance_id
+                for group in self.task_groups
+                if group.source_group_instance_id is not None
+            }
             if any(
                 group.lifecycle not in {"exiting", "disappeared"}
+                and group.group_instance_id not in replacement_source_ids
+                and group.source_group_instance_id not in linked_group_ids
                 for group in unlinked_groups
             ):
                 raise ValueError(
-                    "regional execution unlinked groups must be exiting or disappeared"
+                    "regional execution unlinked groups must be replacement peers "
+                    "or terminal"
                 )
         if self.tracking_control.mode == "dedicated":
             if len(self.task_groups) not in {1, 4, 5, 8}:
@@ -1307,11 +1494,12 @@ class OperationalFrame(StrictModel):
     mission_events: tuple[MissionEventView, ...] = ()
     uuv_mission_modes: dict[str, str] = Field(default_factory=dict)
     uuv_resources: tuple[UUVResourceView, ...] = ()
+    region_probability_evidence: dict[str, dict[str, object]] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod
     def normalize_legacy_carrier_relationships(cls, value: Any) -> Any:
-        return normalize_legacy_carrier_relationships(value)
+        return sanitize_public_payload(normalize_legacy_carrier_relationships(value))
 
     @model_validator(mode="after")
     def plan_version_matches_active_plan(self) -> OperationalFrame:

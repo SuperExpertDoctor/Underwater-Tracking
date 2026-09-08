@@ -51,6 +51,11 @@ import { displayTargetName } from "../utils/presentation";
 import { timelineRowsForFrame } from "./regionTimeline";
 import { MAP_DISPLAY_CONFIG } from "../../configs/map_display";
 import {
+  estimatePresentationStatus,
+  estimatePresentationStyle,
+  scanTelemetryForRegion,
+} from "../domain/operationalStatus";
+import {
   groupForUuv,
   groupInstanceId,
   groupsByRegionSlot,
@@ -151,6 +156,14 @@ export const TARGET_DETECTION_STYLE = {
   lineDash: [4, 7],
 } as const;
 export const DETECTION_LABEL_LAYER = "labels" as const;
+
+export function targetEstimateLayerStyle(
+  frame: Pick<OperationalFrame, "sim_time_s" | "execution">,
+  target: TargetEstimateView,
+) {
+  const status = estimatePresentationStatus(frame, target);
+  return { status, ...estimatePresentationStyle(status) };
+}
 
 export interface DetectionZoneLabels {
   radiusM: number;
@@ -406,6 +419,8 @@ function executionRegionTaskView(
   );
   const assignedUuvIds = [...activeIds, ...passiveIds];
   const effectStatus = executionEffectStatus(lifecycle);
+  const telemetry = scanTelemetryForRegion(region);
+  const activeCoverage = telemetry?.active_coverage_ratio;
   return {
     region_id: region.region_id,
     display_name: region.region_id,
@@ -436,13 +451,17 @@ function executionRegionTaskView(
     revision: region.execution_revision,
     effect: {
       status: effectStatus,
-      coverage_ratio: effectStatus === "uncovered" ? 0 : 1,
-      quality_score: effectStatus === "degraded" ? 0 : 1,
-      handoff_progress: region.status === "handoff_pending" ? 1 : 0,
-      quality_source: "region_telemetry",
+      coverage_ratio: activeCoverage != null && Number.isFinite(activeCoverage)
+        ? Math.max(0, Math.min(1, activeCoverage))
+        : null,
+      quality_score: null,
+      handoff_progress: null,
+      quality_source: "unavailable",
       hard_guard_reasons: [],
       expert_feedback_ids: [],
     },
+    scan_telemetry: telemetry,
+    handoff_evidence: execution.handoff_evidence ?? null,
   };
 }
 
@@ -1121,7 +1140,7 @@ export default function CanvasMap({
             TARGET_MARKER_SIZE_RANGE_PX.max,
           ),
           submarineAssetRotation(
-            target.heading_rad ?? target.covariance_ellipse.rotation_rad,
+            target.heading_rad ?? target.covariance_ellipse?.rotation_rad ?? 0,
           ),
           UUV_HIT_TOLERANCE_PX,
         ),
@@ -1202,6 +1221,7 @@ export default function CanvasMap({
       data-rendered-prediction-id={paintedPrediction?.prediction_id}
       data-rendered-prediction-revision={paintedPrediction?.prediction_revision}
       data-rendered-target-id={paintedTarget?.target_id}
+      data-rendered-estimate-status={paintedTarget ? estimatePresentationStatus(paintedFrame!, paintedTarget) : undefined}
       data-last-painted-frame-id={paintedFrame?.frame_id}
       data-last-painted-sim-time-s={paintedFrame?.sim_time_s}
       data-last-painted-execution-revision={paintedFrame?.execution?.execution_revision}
@@ -1271,6 +1291,7 @@ export default function CanvasMap({
         data-rendered-prediction-id={paintedPrediction?.prediction_id}
         data-rendered-prediction-revision={paintedPrediction?.prediction_revision}
         data-rendered-target-id={paintedTarget?.target_id}
+        data-rendered-estimate-status={paintedTarget ? estimatePresentationStatus(paintedFrame!, paintedTarget) : undefined}
         data-last-painted-frame-id={paintedFrame?.frame_id}
         data-last-painted-sim-time-s={paintedFrame?.sim_time_s}
         data-last-painted-execution-revision={paintedFrame?.execution?.execution_revision}
@@ -1322,7 +1343,11 @@ export default function CanvasMap({
         <PredictionOverlay
           predictions={executionTargetEstimates(paintedFrame).flatMap((target) =>
             target.prediction
-              ? [{ targetId: target.target_id, prediction: target.prediction }]
+              ? [{
+                  targetId: target.target_id,
+                  prediction: target.prediction,
+                  estimateStatus: estimatePresentationStatus(paintedFrame, target),
+                }]
               : [],
           )}
           width={sizeRef.current.width}
@@ -1341,6 +1366,8 @@ export default function CanvasMap({
       {showPredictedRegions && paintedFrame && paintedMapBounds && (
         <WorldModelEventOverlay
           targets={executionTargetEstimates(paintedFrame)}
+          execution={paintedFrame.execution}
+          simTimeS={paintedFrame.sim_time_s}
           width={sizeRef.current.width}
           height={sizeRef.current.height}
           project={(point) =>
@@ -1618,6 +1645,9 @@ export function stableLabelCandidatesForFrame(
     const text = detection
       ? [
           displayTargetName(target.target_id),
+          targetEstimateLayerStyle(frame, target).status === "live"
+            ? null
+            : `ESTIMATE ${targetEstimateLayerStyle(frame, target).status.toUpperCase()}`,
           detection.rangeText,
           detection.detectedText,
         ]
@@ -1903,11 +1933,14 @@ function drawTargetDetectionZones(
   executionTargetEstimates(frame).forEach((target) => {
     const radius = targetDetectionRange(frame);
     const center = transform(target.mean);
+    const presentation = targetEstimateLayerStyle(frame, target);
+    const isLive = presentation.status === "live";
     context.save();
-    context.strokeStyle = TARGET_DETECTION_STYLE.stroke;
-    context.fillStyle = TARGET_DETECTION_STYLE.fill;
+    context.globalAlpha = isLive ? 1 : presentation.opacity;
+    context.strokeStyle = isLive ? TARGET_DETECTION_STYLE.stroke : presentation.stroke;
+    context.fillStyle = isLive ? TARGET_DETECTION_STYLE.fill : presentation.fill;
     context.lineWidth = 1.5;
-    context.setLineDash(TARGET_DETECTION_STYLE.lineDash);
+    context.setLineDash(isLive ? TARGET_DETECTION_STYLE.lineDash : presentation.dash);
     context.beginPath();
     context.arc(center.x, center.y, radius * scale, 0, Math.PI * 2);
     context.fill();
@@ -1918,8 +1951,8 @@ function drawTargetDetectionZones(
       target_id: target.target_id,
       center,
       radius_px: radius * scale,
-      stroke_style: TARGET_DETECTION_STYLE.stroke,
-      line_dash: [...TARGET_DETECTION_STYLE.lineDash],
+      stroke_style: isLive ? TARGET_DETECTION_STYLE.stroke : presentation.stroke,
+      line_dash: [...(isLive ? TARGET_DETECTION_STYLE.lineDash : presentation.dash)],
     });
   });
   return painted;
@@ -2048,18 +2081,25 @@ function drawEstimates(
   scale: number,
 ) {
   executionTargetEstimates(frame).forEach((target) => {
+    if (!target.covariance_ellipse) return;
     const center = transform(target.mean);
     const ellipse = displayCovarianceEllipse(target.covariance_ellipse, scale);
+    const presentation = targetEstimateLayerStyle(frame, target);
+    const isLive = presentation.status === "live";
     context.save();
+    context.globalAlpha = isLive ? 1 : presentation.opacity;
     context.translate(center.x, center.y);
     context.rotate(-ellipse.rotation_rad);
-    context.strokeStyle =
-      target.classification === "decoy" ? COLORS.amber : COLORS.red;
-    context.fillStyle =
-      target.classification === "decoy"
+    context.strokeStyle = isLive
+      ? target.classification === "decoy" ? COLORS.amber : COLORS.red
+      : presentation.stroke;
+    context.fillStyle = isLive
+      ? target.classification === "decoy"
         ? "rgba(246, 185, 74, 0.08)"
-        : "rgba(255, 111, 127, 0.075)";
+        : "rgba(255, 111, 127, 0.075)"
+      : presentation.fill;
     context.lineWidth = 1.25;
+    context.setLineDash(isLive ? [] : presentation.dash);
     context.beginPath();
     context.ellipse(
       0,
@@ -2072,6 +2112,7 @@ function drawEstimates(
     );
     context.fill();
     context.stroke();
+    context.setLineDash([]);
     context.restore();
   });
 }
@@ -2181,8 +2222,10 @@ function drawTargetSprites(
 ) {
   executionTargetEstimates(frame).forEach((target) => {
     const center = transform(target.mean);
+    const presentation = targetEstimateLayerStyle(frame, target);
+    const isLive = presentation.status === "live";
     const heading =
-      target.heading_rad ?? target.covariance_ellipse.rotation_rad;
+      target.heading_rad ?? target.covariance_ellipse?.rotation_rad ?? 0;
     const size = screenSpriteSize(
       image,
       markerPixels,
@@ -2191,16 +2234,42 @@ function drawTargetSprites(
     );
     if (image) {
       context.save();
+      context.globalAlpha = isLive ? 1 : presentation.opacity;
       context.translate(center.x, center.y);
       context.rotate(submarineAssetRotation(heading));
       drawCenteredImage(context, image, size);
       context.restore();
     } else {
-      context.fillStyle =
-        target.classification === "decoy" ? COLORS.amber : COLORS.red;
+      context.save();
+      context.globalAlpha = isLive ? 1 : presentation.opacity;
+      context.fillStyle = isLive
+        ? target.classification === "decoy" ? COLORS.amber : COLORS.red
+        : presentation.stroke;
       context.beginPath();
       context.arc(center.x, center.y, 4, 0, Math.PI * 2);
       context.fill();
+      context.restore();
+    }
+    if (presentation.status !== "live") {
+      const radius = Math.max(size.width, size.height) / 2 + 7;
+      context.save();
+      context.globalAlpha = Math.min(1, presentation.opacity + 0.12);
+      context.strokeStyle = presentation.stroke;
+      context.lineWidth = 1.35;
+      context.setLineDash(presentation.dash);
+      context.beginPath();
+      context.arc(center.x, center.y, radius, 0, Math.PI * 2);
+      context.stroke();
+      context.setLineDash([]);
+      if (presentation.status === "expired" || presentation.status === "unavailable") {
+        context.beginPath();
+        context.moveTo(center.x - radius * 0.58, center.y - radius * 0.58);
+        context.lineTo(center.x + radius * 0.58, center.y + radius * 0.58);
+        context.moveTo(center.x + radius * 0.58, center.y - radius * 0.58);
+        context.lineTo(center.x - radius * 0.58, center.y + radius * 0.58);
+        context.stroke();
+      }
+      context.restore();
     }
     // Labels are rendered in one deterministic pass after all markers.
   });

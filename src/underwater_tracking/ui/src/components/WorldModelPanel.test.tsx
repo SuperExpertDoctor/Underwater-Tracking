@@ -83,4 +83,13 @@ describe("WorldModelPanel", () => {
     const { container } = render(<WorldModelPanel targets={[target(null)]} />);
     expect(container).toBeEmptyDOMElement();
   });
+
+  it.each(["expired", "unavailable"] as const)("does not present %s as a clear forecast", (status) => {
+    render(<WorldModelPanel targets={[target({ ...FORECAST, events: [], data_status: status,
+      horizons: FORECAST.horizons.map((h) => ({ ...h, covered: false, sample_count: 0 })) })]} />);
+    expect(screen.getByText("当前输入不足以判断未来事件")).toBeInTheDocument();
+    expect(screen.queryByText("当前规则未发现明显未来事件")).not.toBeInTheDocument();
+    expect(screen.queryByText("目标左转")).not.toBeInTheDocument();
+    expect(screen.getAllByText("预测未覆盖")).toHaveLength(4);
+  });
 });

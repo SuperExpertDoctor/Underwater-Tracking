@@ -171,6 +171,12 @@ class GlobalTargetTrackView(ExecutionModel):
     bounded_history: tuple[GlobalTrackSample, ...] = Field(min_length=1)
     source_event_ids: tuple[str, ...] = Field(min_length=1)
     freshness_status: FreshnessStatus = "fresh"
+    source_kind: Literal["observed", "prior", "legacy_unknown"] = "legacy_unknown"
+    last_observed_at_s: NonNegativeFloat | None = None
+    valid_until_s: NonNegativeFloat | None = None
+    covariance_xy: Covariance2 | None = None
+    accepted_observation_ids_this_cycle: tuple[str, ...] = ()
+    reason_codes: tuple[str, ...] = ()
 
     @model_validator(mode="before")
     @classmethod
@@ -271,6 +277,9 @@ class IMMPredictedTrack(ExecutionModel):
     prediction_regime: PredictionRegime
     bspline_times_s: tuple[NonNegativeFloat, ...] = ()
     bspline_centerline_xy: tuple[Point2, ...] = ()
+    last_observed_at_s: NonNegativeFloat | None = None
+    generated_at_s: NonNegativeFloat | None = None
+    valid_until_s: NonNegativeFloat | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -368,6 +377,14 @@ class TrackingControlState(ExecutionModel):
     dedicated_release_triggered_at_m: NonNegativeFloat | None = None
     dedicated_release_reason: str | None = None
     source_event_ids: tuple[str, ...] = ()
+    handoff_observation_cycle_s: int | None = Field(default=None, ge=0)
+    successor_required_uuv_ids: tuple[str, ...] = ()
+    successor_deployed_uuv_ids: tuple[str, ...] = ()
+    successor_healthy_uuv_ids: tuple[str, ...] = ()
+    successor_passive_uuv_ids: tuple[str, ...] = ()
+    successor_observing_uuv_ids: tuple[str, ...] = ()
+    successor_evidence_ids: tuple[str, ...] = ()
+    handoff_blocked_reason: str | None = None
 
     @model_validator(mode="after")
     def validate_group_references(self) -> TrackingControlState:
@@ -388,6 +405,20 @@ class TrackingControlState(ExecutionModel):
             raise ValueError("tracking owner and pending successor must differ")
         if any(not event_id.strip() for event_id in self.source_event_ids):
             raise ValueError("tracking control source event IDs must not be empty")
+        readiness_fields = (
+            self.successor_required_uuv_ids,
+            self.successor_deployed_uuv_ids,
+            self.successor_healthy_uuv_ids,
+            self.successor_passive_uuv_ids,
+            self.successor_observing_uuv_ids,
+        )
+        if any(len(values) != len(set(values)) for values in readiness_fields):
+            raise ValueError("tracking successor readiness IDs must be unique")
+        required = set(self.successor_required_uuv_ids)
+        if any(not set(values).issubset(required) for values in readiness_fields[1:]):
+            raise ValueError("tracking successor readiness must reference required UUVs")
+        if any(not event_id.strip() for event_id in self.successor_evidence_ids):
+            raise ValueError("tracking successor evidence IDs must not be empty")
         return self
 
 
@@ -677,9 +708,10 @@ def _validate_runtime_task_groups(
             "five restore, or eight overlap task groups"
         )
 
-    configured_region_ids = set(region_ids)
+    ordered_region_ids = tuple(region_ids)
+    configured_region_ids = set(ordered_region_ids)
     groups_by_region: dict[str, list[TaskGroupInstance]] = {
-        region_id: [] for region_id in configured_region_ids
+        region_id: [] for region_id in ordered_region_ids
     }
     for group in groups:
         if group.region_id not in configured_region_ids:
@@ -709,15 +741,17 @@ def _validate_runtime_task_groups(
             in {TaskGroupLifecycle.EXITING, TaskGroupLifecycle.DISAPPEARED}
             for slot_groups in groups_by_region.values()
         ):
-            owner = groups_by_id.get(owner_id) if owner_id is not None else None
+            regional_owner = (
+                groups_by_id.get(owner_id) if owner_id is not None else None
+            )
             exiting_groups = tuple(
                 group
                 for group in groups
                 if group.lifecycle is TaskGroupLifecycle.EXITING
             )
             if (
-                owner is None
-                or owner.lifecycle is not TaskGroupLifecycle.PASSIVE_TRACK
+                regional_owner is None
+                or regional_owner.lifecycle is not TaskGroupLifecycle.PASSIVE_TRACK
                 or len(exiting_groups) != 1
                 or region_topology is None
             ):
@@ -746,25 +780,40 @@ def _validate_runtime_task_groups(
                         "every terminal group in a regional transition requires an incoming pair"
                     )
                 if len(slot_groups) == 2:
-                    exiting_groups = tuple(
-                        group
-                        for group in slot_groups
-                        if group.lifecycle is TaskGroupLifecycle.EXITING
-                    )
+                    slot_ids = {
+                        group.group_instance_id for group in slot_groups
+                    }
                     incoming_groups = tuple(
                         group
                         for group in slot_groups
-                        if group.lifecycle is not TaskGroupLifecycle.EXITING
+                        if group.source_group_instance_id in slot_ids
                     )
                     if (
-                        len(exiting_groups) != 1
-                        or len(incoming_groups) != 1
-                        or incoming_groups[0].lifecycle
-                        is TaskGroupLifecycle.DISAPPEARED
+                        len(incoming_groups) != 1
+                        or incoming_groups[0].source_group_instance_id
+                        == incoming_groups[0].group_instance_id
                     ):
                         raise ValueError(
-                            "regional replacement pair requires one exiting outgoing "
-                            "and one current non-exiting incoming group"
+                            "regional replacement pair requires one source-linked incoming group"
+                        )
+                    incoming = incoming_groups[0]
+                    source_group_id = incoming.source_group_instance_id
+                    if source_group_id is None:
+                        raise ValueError(
+                            "regional replacement pair requires one source-linked "
+                            "incoming group"
+                        )
+                    outgoing = groups_by_id[source_group_id]
+                    if incoming.lifecycle is TaskGroupLifecycle.DISAPPEARED:
+                        raise ValueError(
+                            "regional replacement pair requires a non-exiting incoming group"
+                        )
+                    if (
+                        incoming.deployment_revision <= outgoing.deployment_revision
+                        or outgoing.lifecycle is TaskGroupLifecycle.DISAPPEARED
+                    ):
+                        raise ValueError(
+                            "regional replacement pair has an invalid deployment order"
                         )
         return
 
@@ -943,6 +992,38 @@ class EvidenceResolution(ExecutionModel):
     frame_id: int | None = Field(default=None, ge=0)
 
 
+class ExecutionSemanticAdvice(ExecutionModel):
+    """Revision-bound, operator-facing advice that cannot change execution."""
+
+    situation_revision: int = Field(ge=0)
+    base_execution_revision: int = Field(ge=1)
+    prediction_revision: int = Field(ge=1)
+    strategy_explanation: str = Field(min_length=1, max_length=1000)
+    priority: UnitFloat = 0.5
+    timing_preference: Literal[
+        "earliest_feasible",
+        "balanced",
+        "latest_feasible",
+        "hold_current",
+    ] = "balanced"
+    tracking_mode_suggestion: Literal[
+        "active_scan",
+        "passive_track",
+        "handoff_reserve",
+        "hold_current",
+    ] = "hold_current"
+    rationale: str = Field(min_length=1, max_length=2000)
+    evidence_ids: tuple[str, ...] = Field(min_length=1, max_length=32)
+
+    @model_validator(mode="after")
+    def validate_evidence_ids(self) -> ExecutionSemanticAdvice:
+        if any(not evidence_id.strip() for evidence_id in self.evidence_ids):
+            raise ValueError("semantic advice evidence IDs must not be empty")
+        if len(set(self.evidence_ids)) != len(self.evidence_ids):
+            raise ValueError("semantic advice evidence IDs must be unique")
+        return self
+
+
 class ExecutionDecisionRecord(ExecutionModel):
     """Auditable explanation metadata for one committed execution revision."""
 
@@ -993,6 +1074,7 @@ class OperationalExecutionSnapshot(ExecutionModel):
     valid_from_s: NonNegativeFloat
     valid_until_s: PositiveFloat
     plan_source: PlanSource
+    semantic_advice: ExecutionSemanticAdvice | None = None
     tracking_policy: Any
     target_track: GlobalTargetTrackView
     prediction: IMMPredictedTrack
@@ -1091,6 +1173,7 @@ __all__ = [
     "ExecutionDecisionRecord",
     "ExecutionDegradation",
     "ExecutionRegion",
+    "ExecutionSemanticAdvice",
     "GlobalTargetTrackView",
     "GlobalTrackSample",
     "GroupSensorMode",

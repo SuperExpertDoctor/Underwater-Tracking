@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from math import hypot, pi
+from tests.public_contract_fixtures import prior_bearing
 
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.models import (
@@ -1329,7 +1330,7 @@ def test_region_entry_uses_public_belief_mass_and_omits_invalid_mass() -> None:
                 sim_time_s=0,
                 observer_id="uuv_00",
                 target_id="target_00",
-                azimuth_rad=0.1,
+                azimuth_rad=prior_bearing(engine, "uuv_00"),
                 variance_rad2=0.01,
                 detection_confidence=0.9,
                 snr_db=8.0,
@@ -1464,7 +1465,7 @@ def test_handoff_evidence_joins_only_current_successor_passive_observations() ->
                 sim_time_s=60,
                 observer_id="uuv_01",
                 target_id="target_00",
-                azimuth_rad=0.1,
+                azimuth_rad=prior_bearing(engine, "uuv_01", 60),
                 variance_rad2=0.01,
                 detection_confidence=0.9,
                 snr_db=8.0,

@@ -43,6 +43,7 @@ from underwater_tracking.agent.prompts import (
     canonical_digest,
 )
 from underwater_tracking.agent.state import CarrierState
+from underwater_tracking.domain.public_payload import sanitize_public_mapping
 from underwater_tracking.domain.agent_models import (
     DecisionRecord,
     PlanDiff,
@@ -53,6 +54,7 @@ from underwater_tracking.domain.models import SituationSnapshot, StrictModel
 from underwater_tracking.domain.execution_models import (
     ExecutionDecisionRecord,
 )
+from underwater_tracking.domain.conversation_models import OperationalDiagnosis
 from underwater_tracking.domain.memory_models import (
     MemoryContext,
     MemoryEvidenceTrace,
@@ -105,6 +107,7 @@ class QuestionAnswer(StrictModel):
     frame_id: int | None = None
     unresolved_evidence: tuple[str, ...] = ()
     decision_record: ExecutionDecisionRecord | None = None
+    diagnosis: OperationalDiagnosis | None = None
 
 
 class QuestionEvidenceError(ValueError):
@@ -278,7 +281,7 @@ def build_question_payload(
         if memory_context is not None
         else ()
     )
-    return {
+    return sanitize_public_mapping({
         "model": model_id,
         "temperature": temperature,
         "system_prompt": EXPLANATION_SYSTEM_PROMPT,
@@ -315,7 +318,7 @@ def build_question_payload(
             if counterfactual is not None
             else None
         ),
-    }
+    })
 
 
 def validate_question_answer(

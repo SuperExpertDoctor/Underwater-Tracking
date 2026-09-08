@@ -104,6 +104,11 @@ class PredictedTrackRef(StrictModel):
     target_id: str
     sim_time_s: int = Field(ge=0)
     horizon_s: float = Field(gt=0)
+    source_track_revision: int | None = Field(default=None, ge=1)
+    last_observed_at_s: float | None = Field(default=None, ge=0)
+    generated_at_s: float | None = Field(default=None, ge=0)
+    valid_until_s: float | None = Field(default=None, ge=0)
+    prediction_revision: int | None = Field(default=None, ge=1)
     sample_step_s: float = Field(gt=0)
     times_s: tuple[float, ...] = ()
     points_xy: tuple[tuple[float, float], ...] = ()

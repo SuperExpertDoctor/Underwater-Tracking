@@ -125,6 +125,9 @@ def build_demo_input(scenario: ScenarioName) -> RuleWorldModelInput:
         tracking=tracking,
         map_bounds_xy=map_bounds,
         source_observation_ids=("demo-observation-01",),
+        source_track_revision=1, prediction_revision=1, source_status="current",
+        last_observed_at_s=as_of_s, generated_at_s=as_of_s, valid_until_s=as_of_s + 900.,
+        source_prediction_id=f"demo-{scenario}-bspline",
     )
 
 

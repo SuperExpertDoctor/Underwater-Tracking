@@ -77,6 +77,11 @@ class PredictionDiffRuntime(Runtime):
             prediction_id="P2",
             target_id="T1",
             sim_time_s=30,
+            source_track_revision=1,
+            prediction_revision=1,
+            last_observed_at_s=30.,
+            generated_at_s=30.,
+            valid_until_s=930.,
             horizon_s=60.0,
             sample_step_s=30.0,
             times_s=(60.0, 90.0),
@@ -195,11 +200,17 @@ def test_live_publisher_does_not_publish_raw_prediction_as_valid() -> None:
 
 class WorldModelRuntime(Runtime):
     def get_state(self):
-        forecast = predict_future_events(build_demo_input("left_turn"))
+        from tests.world_model.test_rule_world_model import _snapshot_from_demo
+        demo = build_demo_input("left_turn").model_copy(update={"scenario_id": "S1"})
+        _, prediction, _ = _snapshot_from_demo(demo)
+        forecast = predict_future_events(demo)
         return {
             "intent_hypotheses": {},
             "predictions": {},
             "world_model_forecasts": {forecast.target_id: forecast},
+            "accepted_predictions": {forecast.target_id: AcceptedPrediction(prediction=prediction,
+                health=PredictionHealth(status="valid", regime="bspline", source_track_age_s=0.,
+                    clipped_point_fraction=0., maximum_radius_m=100., raw_prediction_id=prediction.prediction_id))},
         }
 
 
@@ -557,6 +568,7 @@ def test_publisher_projects_checkpointed_prediction_diff_to_replay(tmp_path: Pat
             target_id="T1",
             sim_time_s=30,
             mean=(30.0, 0.0),
+            track_revision=1, last_observed_at_s=30, valid_until_s=930, source_observation_ids=("O1",),
             covariance=((100.0, 0.0), (0.0, 100.0)),
             model_probabilities={"cv": 1.0},
         ),
@@ -609,6 +621,7 @@ def test_publisher_projects_world_model_forecast_to_replay(tmp_path: Path) -> No
             mean=(0.0, 0.0),
             covariance=((100.0, 0.0), (0.0, 100.0)),
             model_probabilities={"left_turn": 0.78, "cv": 0.17, "right_turn": 0.05},
+            track_revision=1, last_observed_at_s=300, valid_until_s=1200, source_observation_ids=("demo-observation-01",),
         ),
         quality=GroupQuality(
             instant=0.8,

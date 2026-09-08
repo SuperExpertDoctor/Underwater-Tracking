@@ -47,11 +47,12 @@ export default function WorldModelPanel({ targets }: WorldModelPanelProps) {
             <div className="world-model-target-heading">
               <strong>{displayTargetName(target.target_id)}</strong>
               <span className={`data-${forecast.data_status}`}>
-                {forecast.data_status === "ready" ? "输入完整" : "降级推演"}
+                {{ready: "输入完整", degraded: "降级推演", expired: "数据已过期", unavailable: "暂不可用"}[forecast.data_status]}
               </span>
             </div>
             {forecast.events.length === 0 && (
-              <p className="world-model-clear">当前规则未发现明显未来事件</p>
+              <p className="world-model-clear">{["expired", "unavailable"].includes(forecast.data_status)
+                ? "当前输入不足以判断未来事件" : "当前规则未发现明显未来事件"}</p>
             )}
             <div className="world-model-horizons">
               {forecast.horizons.map((horizon) => {
@@ -94,7 +95,7 @@ export default function WorldModelPanel({ targets }: WorldModelPanelProps) {
             )}
             <div className="world-model-provenance">
               <span>{`IMM ${leadingImmModel(forecast.imm_model_probabilities)}`}</span>
-              <span title={forecast.source_prediction_id}>B-spline 轨迹</span>
+              <span title={forecast.source_prediction_id}>已接受的预测轨迹</span>
               {forecast.source_plan_revision != null && (
                 <span>{`方案 v${forecast.source_plan_revision}`}</span>
               )}

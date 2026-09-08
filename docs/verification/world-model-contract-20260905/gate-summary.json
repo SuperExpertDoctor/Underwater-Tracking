@@ -1,0 +1,145 @@
+{
+  "round": "world-model-data-contract-20260905",
+  "date": "2026-09-05",
+  "base_master": "2c444bb347c17fa25aa7ac136c70d3a234bf5fc6",
+  "branch": "fix/world-model-data-contract-20260905",
+  "decision": "READY_FOR_WORLD_MODEL_MODULE_REVIEW_NOT_JOINT_ACCEPTANCE",
+  "scope": {
+    "uuv_count": 12,
+    "groups": 4,
+    "members_per_group": 3,
+    "control_authority": false,
+    "model_kind": "rule_demo",
+    "control_policy_changed": false,
+    "ui_layout_changed": false,
+    "training_started": false,
+    "deepseek_used": false
+  },
+  "gates": {
+    "W01": {
+      "status": "PASS_SCOPED",
+      "evidence": [
+        "tests/groups/test_public_track_contract.py",
+        "tests/tracking/test_public_estimate.py",
+        "ordinary-repeat-summary.json"
+      ],
+      "limits": [
+        "Bounded 3600s repeat with deterministic LLM test double; not external-provider mission acceptance."
+      ]
+    },
+    "W02_provider": {
+      "status": "PASS_SCOPED",
+      "evidence": [
+        "tests/tracking/test_public_estimate.py",
+        "tests/world_model/test_truth_transport_contract.py"
+      ],
+      "limits": [
+        "Mission controller does not yet consume eligible_for_confirmation/distinct source revision for confirmation count; no first-owner success demonstrated."
+      ]
+    },
+    "W02_end_to_end": {
+      "status": "NOT_VERIFIED",
+      "required_next": "UUV control owner consumes probability quality and distinct-revision evidence, then ordinary-run first-owner acceptance."
+    },
+    "W03": {
+      "status": "PASS_SCOPED",
+      "evidence": [
+        "tests/world_model/test_publication_contract.py",
+        "tests/api/test_live_publisher.py"
+      ],
+      "limits": [
+        "Owner-context switch is fault-injected contract evidence, not a naturally observed handoff. No timed UUV future trajectories in execution snapshot."
+      ]
+    },
+    "W04": {
+      "status": "PASS_SCOPED",
+      "evidence": [
+        "tests/world_model/test_truth_transport_contract.py"
+      ],
+      "limits": [
+        "Capture-only intent-analysis payload and shared operational transports; not an exhaustive real-provider or future-plugin audit."
+      ]
+    },
+    "joint_acceptance": {
+      "status": "NOT_RUN",
+      "reasons": [
+        "No external-provider run",
+        "master lacks tools.run_default_live_acceptance",
+        "No first owner or owner change observed",
+        "Other owners control and LLM work pending"
+      ]
+    },
+    "trained_model_accuracy": {
+      "status": "NOT_APPLICABLE",
+      "reason": "Heuristic scores are not calibrated event probabilities; no training or event-label accuracy evaluation."
+    }
+  },
+  "validation": {
+    "python_regression": {
+      "passed": 2275,
+      "failed": 2,
+      "skipped": 46,
+      "deselected": 25,
+      "duration_s": 273.57,
+      "excluded_markers": [
+        "real_llm",
+        "long_running",
+        "live_acceptance"
+      ],
+      "excluded_missing_driver_files": [
+        "tests/acceptance/test_default_live_acceptance.py",
+        "tests/acceptance/test_default_live_acceptance_driver.py"
+      ],
+      "baseline_reproduced_failures": [
+        "tests/agent/test_runtime_master_slave_adversary.py::test_agent_loop_uses_real_memory_provider_chain_when_configured",
+        "tests/agent/test_runtime_master_slave_adversary.py::test_local_memory_provider_does_not_require_embedding_api_key"
+      ],
+      "status": "NOT_ALL_GREEN_BASELINE_FAILURES"
+    },
+    "scoped_contracts": {
+      "passed": 106,
+      "failed": 0
+    },
+    "frontend": {
+      "passed": 143,
+      "failed": 0,
+      "typescript": "PASS",
+      "production_build": "PASS",
+      "browser_visual_acceptance": "NOT_RUN"
+    },
+    "lint": {
+      "changed_python_files": 39,
+      "findings_on_new_or_changed_lines": 0,
+      "existing_findings_in_changed_files": 25
+    },
+    "transient_failure": {
+      "test": "tests/world_model/test_showcase.py::test_showcase_api_serves_snapshot_replay_and_websocket",
+      "failure": "CancelledError on WebSocket context exit",
+      "subsequent_results": "Passed in separate run and final full regression; no production WebSocket fix claimed."
+    }
+  },
+  "ordinary_diagnostic": {
+    "runs": 2,
+    "seed": 42,
+    "physics_step_s": 5,
+    "seconds_per_run": 3600,
+    "accepted_source_observation_count": 9,
+    "max_track_revision": 8,
+    "carrier_errors": 0,
+    "clean_shutdown": true,
+    "trace_equal": true,
+    "trace_sha256": "bcc94b2da43b0109adc468b9493ef5361312196b00a9ff0a30678b7e15f81351",
+    "first_owner_seen": false,
+    "owner_change_seen": false,
+    "event_count_warning": "22 target_abnormal_stop cards across frames, not 22 real incidents or an accuracy metric."
+  },
+  "environment": {
+    "python": "3.12.14",
+    "numpy": "2.3.5",
+    "scipy": "1.18.1",
+    "pydantic": "2.13.5",
+    "pytest": "8.4.2",
+    "ruff": "0.16.5",
+    "shared_environment_changed": false
+  }
+}

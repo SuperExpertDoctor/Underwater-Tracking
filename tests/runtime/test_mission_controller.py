@@ -1,3 +1,5 @@
+from math import hypot
+
 import pytest
 
 from underwater_tracking.config.models import TrackingPolicyConfig
@@ -27,6 +29,7 @@ from underwater_tracking.runtime.mission_controller import (
     MissionController,
     MissionSnapshot as RuntimeMissionSnapshot,
     _select_runtime_group,
+    execution_snapshot_to_mission_plan,
 )
 
 
@@ -84,9 +87,7 @@ def test_execution_snapshot_status_overrides_rolling_lifecycle_progress() -> Non
                 for region in initial.regions
             ),
             "task_groups": tuple(
-                group.model_copy(
-                    update={"execution_revision": initial.execution_revision + 1}
-                )
+                group.model_copy(update={"execution_revision": initial.execution_revision + 1})
                 for group in initial.task_groups
             ),
         },
@@ -104,8 +105,7 @@ def test_execution_snapshot_uses_group_lifecycle_for_all_members() -> None:
         deep=True,
         update={
             "regions": tuple(
-                region.model_copy(update={"status": "passive"})
-                for region in initial.regions
+                region.model_copy(update={"status": "passive"}) for region in initial.regions
             ),
             "task_groups": tuple(
                 group.model_copy(
@@ -127,6 +127,18 @@ def test_execution_snapshot_uses_group_lifecycle_for_all_members() -> None:
             snapshot.uuv_modes[uuv_id] is UUVMissionMode.PASSIVE_TRACK
             for uuv_id in group.member_uuv_ids
         )
+
+
+def test_execution_snapshot_plan_records_every_runtime_member_episode() -> None:
+    snapshot = _execution_snapshot()
+
+    plan = execution_snapshot_to_mission_plan(snapshot)
+
+    expected_members = {
+        member_id for group in snapshot.task_groups for member_id in group.member_uuv_ids
+    }
+    assert set(plan.resource_episode_by_uuv) == expected_members
+    assert set(plan.resource_episode_by_uuv.values()) == {0}
 
 
 def test_execution_snapshot_preserves_recovered_region_lifecycle() -> None:
@@ -155,9 +167,7 @@ def test_execution_snapshot_preserves_recovered_region_lifecycle() -> None:
                 for region in initial.regions
             ),
             "task_groups": tuple(
-                group.model_copy(
-                    update={"execution_revision": initial.execution_revision + 1}
-                )
+                group.model_copy(update={"execution_revision": initial.execution_revision + 1})
                 for group in initial.task_groups
             ),
         },
@@ -175,9 +185,11 @@ def test_default_live_controller_registers_authoritative_onboard_inventory() -> 
     snapshot = controller.snapshot()
     assert len(snapshot.uuv_resources) == 12
     assert set(snapshot.uuv_modes.values()) == {UUVMissionMode.ONBOARD}
-    assert {
-        resource.carrier_id for resource in snapshot.uuv_resources.values()
-    } == {"carrier_02", "carrier_03", "carrier_04"}
+    assert {resource.carrier_id for resource in snapshot.uuv_resources.values()} == {
+        "carrier_02",
+        "carrier_03",
+        "carrier_04",
+    }
     assert all(resource.mileage_m == 0.0 for resource in snapshot.uuv_resources.values())
 
 
@@ -258,8 +270,7 @@ def _runtime_group(
         region_id=region_id,
         deployment_revision=deployment_revision,
         member_uuv_ids=tuple(
-            f"{group_id}:member:{member_index:02d}"
-            for member_index in range(1, 4)
+            f"{group_id}:member:{member_index:02d}" for member_index in range(1, 4)
         ),
         lifecycle=lifecycle,
         sensor_mode=sensor_mode,
@@ -315,11 +326,7 @@ def _runtime_execution_snapshot(
         )
         for index, region in enumerate(base.regions)
     )
-    owner_id = (
-        groups[0].group_instance_id
-        if r1_ownership_status == "owner"
-        else None
-    )
+    owner_id = groups[0].group_instance_id if r1_ownership_status == "owner" else None
     return base.model_copy(
         deep=True,
         update={
@@ -347,14 +354,23 @@ def _runtime_controller(**snapshot_updates: object) -> MissionController:
     return controller
 
 
+def test_runtime_task_group_lookup_returns_current_group_without_projection() -> None:
+    controller = _runtime_controller()
+    expected = _runtime_group_from_snapshot(controller, "target_00:task:01")
+    member_id = expected.member_uuv_ids[0]
+
+    assert controller.runtime_task_group(expected.group_instance_id) == expected
+    assert controller.runtime_task_group("missing-group") is None
+    assert controller.runtime_uuv_mode(member_id) is UUVMissionMode.ACTIVE_SCAN
+    assert controller.runtime_uuv_mode("missing-uuv") is None
+
+
 def _runtime_group_from_snapshot(
     controller: MissionController,
     region_id: str,
 ) -> TaskGroupInstance:
     return next(
-        group
-        for group in controller.snapshot().task_groups
-        if group.region_id == region_id
+        group for group in controller.snapshot().task_groups if group.region_id == region_id
     )
 
 
@@ -365,16 +381,11 @@ def _runtime_replacement_snapshot(
     shifted_slots: tuple[int, ...] = (0, 1, 2, 3),
     shift_m: float = 100.0,
 ) -> OperationalExecutionSnapshot:
-    groups = tuple(
-        _runtime_group(slot, deployment_revision=revision)
-        for slot in range(1, 5)
-    )
+    groups = tuple(_runtime_group(slot, deployment_revision=revision) for slot in range(1, 5))
     shifted_regions = []
     for region in base.regions:
         if region.slot_index not in shifted_slots:
-            shifted_regions.append(
-                region.model_copy(update={"execution_revision": revision})
-            )
+            shifted_regions.append(region.model_copy(update={"execution_revision": revision}))
             continue
         center = (region.center[0] + shift_m, region.center[1] + shift_m)
         geometry = tuple((x + shift_m, y + shift_m) for x, y in region.geometry)
@@ -385,7 +396,7 @@ def _runtime_replacement_snapshot(
                     "geometry": geometry,
                     "geometry_revision": region.geometry_revision + 1,
                     "execution_revision": revision,
-                "task_group_id": groups[region.slot_index].group_instance_id,
+                    "task_group_id": groups[region.slot_index].group_instance_id,
                 }
             )
         )
@@ -405,16 +416,13 @@ def test_runtime_group_entry_switches_all_three_members_to_passive() -> None:
     controller = _runtime_controller()
     group = _runtime_group_from_snapshot(controller, "target_00:task:01")
 
-    controller.observe(
-        {"region_entry_probabilities": {group.region_id: 0.70}}
+    controller.observe({"region_entry_probabilities": {group.region_id: 0.70}})
+    assert (
+        _runtime_group_from_snapshot(controller, group.region_id).lifecycle
+        is TaskGroupLifecycle.ACTIVE_SCAN
     )
-    assert _runtime_group_from_snapshot(
-        controller, group.region_id
-    ).lifecycle is TaskGroupLifecycle.ACTIVE_SCAN
 
-    snapshot = controller.observe(
-        {"region_entry_probabilities": {group.region_id: 0.81}}
-    )
+    snapshot = controller.observe({"region_entry_probabilities": {group.region_id: 0.81}})
     tracked = _runtime_group_from_snapshot(controller, group.region_id)
     assert tracked.lifecycle is TaskGroupLifecycle.PASSIVE_TRACK
     assert tracked.sensor_mode is GroupSensorMode.PASSIVE
@@ -422,6 +430,146 @@ def test_runtime_group_entry_switches_all_three_members_to_passive() -> None:
         snapshot.uuv_modes[uuv_id] is UUVMissionMode.PASSIVE_TRACK
         for uuv_id in tracked.member_uuv_ids
     )
+
+
+def test_runtime_entry_publishes_probability_confirmation_and_public_evidence() -> None:
+    controller = _runtime_controller()
+    group = _runtime_group_from_snapshot(controller, "target_00:task:01")
+    first_evidence = ("passive:uuv_00:target_00:30",)
+
+    first = controller.observe(
+        {
+            "region_entry_probabilities": {group.region_id: 0.70},
+            "region_entry_evidence_ids": {group.region_id: first_evidence},
+        }
+    )
+    first_region = next(region for region in first.regions if region.region_id == group.region_id)
+    assert first_region.entry_probability == 0.70
+    assert first_region.entry_confirmations == 1
+    assert first_region.entry_confirmation_required == 2
+    assert first_region.entry_reset_reason is None
+    assert first_region.entry_evidence_ids == first_evidence
+
+    second_evidence = (
+        "passive:uuv_00:target_00:60",
+        "passive:uuv_01:target_00:60",
+    )
+    second = controller.observe(
+        {
+            "region_entry_probabilities": {group.region_id: 0.81},
+            "region_entry_evidence_ids": {group.region_id: second_evidence},
+        }
+    )
+    second_region = next(region for region in second.regions if region.region_id == group.region_id)
+    owners = tuple(item for item in second.task_groups if item.ownership_status == "owner")
+    assert second_region.entry_probability == 0.81
+    assert second_region.entry_confirmations == 2
+    assert second_region.entry_evidence_ids == second_evidence
+    assert len(owners) == 1
+    assert owners[0].group_instance_id == group.group_instance_id
+    assert all(
+        second.uuv_modes[member_id] is UUVMissionMode.PASSIVE_TRACK
+        for member_id in group.member_uuv_ids
+    )
+
+
+def test_runtime_entry_counts_at_most_once_per_observation_cycle() -> None:
+    controller = _runtime_controller()
+    region_id = "target_00:task:01"
+    cycle_s = controller.snapshot().sim_time_s + 10
+
+    first = controller.advance(
+        cycle_s,
+        {
+            "region_entry_probabilities": {region_id: 0.80},
+            "region_entry_evidence_ids": {region_id: (f"observation:{cycle_s}:first",)},
+        },
+    )
+    duplicate = controller.advance(
+        cycle_s,
+        {
+            "region_entry_probabilities": {region_id: 0.85},
+            "region_entry_evidence_ids": {region_id: (f"observation:{cycle_s}:updated",)},
+        },
+    )
+
+    first_region = next(region for region in first.regions if region.region_id == region_id)
+    duplicate_region = next(region for region in duplicate.regions if region.region_id == region_id)
+    assert first_region.entry_confirmations == 1
+    assert duplicate_region.entry_confirmations == 1
+    assert duplicate_region.entry_observation_cycle_s == cycle_s
+    assert duplicate_region.lifecycle is RegionLifecycle.ACTIVE_SCAN
+
+
+def test_runtime_deployment_sync_does_not_consume_entry_observation_cycle() -> None:
+    controller = _runtime_controller()
+    region_id = "target_00:task:01"
+    first_cycle_s = controller.snapshot().sim_time_s + 10
+    second_cycle_s = first_cycle_s + 10
+
+    first = controller.advance(
+        first_cycle_s,
+        {"region_entry_probabilities": {region_id: 0.80}},
+    )
+    deployment_sync = controller.advance(
+        second_cycle_s,
+        {"evaluate_entry_observation": False},
+    )
+    completed = controller.advance(
+        second_cycle_s,
+        {"region_entry_probabilities": {region_id: 0.81}},
+    )
+
+    first_region = next(item for item in first.regions if item.region_id == region_id)
+    sync_region = next(item for item in deployment_sync.regions if item.region_id == region_id)
+    completed_group = _runtime_group_from_snapshot(controller, region_id)
+    assert first_region.entry_confirmations == 1
+    assert sync_region.entry_confirmations == 1
+    assert sync_region.entry_observation_cycle_s == first_cycle_s
+    assert completed_group.lifecycle is TaskGroupLifecycle.PASSIVE_TRACK
+    assert completed_group.sensor_mode is GroupSensorMode.PASSIVE
+    assert completed.tracking_control.tracking_owner_group_id == (completed_group.group_instance_id)
+
+
+@pytest.mark.parametrize(
+    ("second_observation", "expected_reason"),
+    [
+        ({}, "missing_probability"),
+        (
+            {"region_entry_probabilities": {"target_00:task:01": float("nan")}},
+            "non_finite_probability",
+        ),
+        (
+            {"region_entry_probabilities": {"target_00:task:01": 0.69}},
+            "below_threshold",
+        ),
+        (
+            {
+                "region_entry_probabilities": {"target_00:task:01": 0.90},
+                "target_exit_predicted": "target_00:task:01",
+            },
+            "simultaneous_exit",
+        ),
+    ],
+)
+def test_runtime_entry_reset_reason_is_structured(
+    second_observation: dict[str, object],
+    expected_reason: str,
+) -> None:
+    controller = _runtime_controller()
+    region_id = "target_00:task:01"
+    controller.observe(
+        {
+            "region_entry_probabilities": {region_id: 0.80},
+            "region_entry_evidence_ids": {region_id: ("observation:first",)},
+        }
+    )
+
+    snapshot = controller.observe(second_observation)
+    region = next(item for item in snapshot.regions if item.region_id == region_id)
+
+    assert region.entry_confirmations == 0
+    assert region.entry_reset_reason == expected_reason
 
 
 def test_runtime_entry_confirmation_resets_on_below_threshold_and_missing_cycle() -> None:
@@ -436,9 +584,81 @@ def test_runtime_entry_confirmation_resets_on_below_threshold_and_missing_cycle(
     assert controller.snapshot().regions[0].entry_confirmations == 0
     controller.observe({"region_entry_probabilities": {region_id: 0.80}})
     assert controller.snapshot().regions[0].entry_confirmations == 1
-    assert _runtime_group_from_snapshot(
-        controller, region_id
-    ).lifecycle is TaskGroupLifecycle.ACTIVE_SCAN
+    assert (
+        _runtime_group_from_snapshot(controller, region_id).lifecycle
+        is TaskGroupLifecycle.ACTIVE_SCAN
+    )
+
+
+def test_runtime_scan_state_is_source_backed_monotonic_and_threshold_gated() -> None:
+    controller = _runtime_controller()
+    region_id = "target_00:task:01"
+    group = _runtime_group_from_snapshot(controller, region_id)
+
+    first = controller.observe(
+        {
+            "runtime_scan_states": {
+                region_id: {
+                    "group_instance_id": group.group_instance_id,
+                    "coverage": 0.25,
+                    "route_progress": 1.0,
+                    "scan_round": 1,
+                    "ping_count": 2,
+                    "evidence_ids": ("active_ping:first", "active_ping:second"),
+                }
+            }
+        }
+    )
+    first_region = next(item for item in first.regions if item.region_id == region_id)
+    assert first_region.coverage == pytest.approx(0.25)
+    assert first_region.route_progress == pytest.approx(1.0)
+    assert first_region.scan_round == 1
+    assert first_region.ping_count == 2
+    assert first_region.scan_completed is False
+    assert first_region.scan_evidence_ids == (
+        "active_ping:first",
+        "active_ping:second",
+    )
+
+    second = controller.observe(
+        {
+            "runtime_scan_states": {
+                region_id: {
+                    "group_instance_id": group.group_instance_id,
+                    "coverage": 0.10,
+                    "route_progress": 0.10,
+                    "scan_round": 2,
+                    "ping_count": 1,
+                    "evidence_ids": ("active_ping:first",),
+                }
+            }
+        }
+    )
+    second_region = next(item for item in second.regions if item.region_id == region_id)
+    assert second_region.coverage == pytest.approx(0.10)
+    assert second_region.route_progress == pytest.approx(0.10)
+    assert second_region.scan_round == 2
+    assert second_region.ping_count == 1
+    assert second_region.scan_completed is False
+    assert second_region.scan_evidence_ids == ("active_ping:first",)
+
+    completed = controller.observe(
+        {
+            "runtime_scan_states": {
+                region_id: {
+                    "group_instance_id": group.group_instance_id,
+                    "coverage": 0.95,
+                    "route_progress": 0.20,
+                    "scan_round": 2,
+                    "ping_count": 3,
+                    "evidence_ids": ("active_ping:third",),
+                }
+            }
+        }
+    )
+    completed_region = next(item for item in completed.regions if item.region_id == region_id)
+    assert completed_region.coverage == pytest.approx(0.95)
+    assert completed_region.scan_completed is True
 
 
 def test_runtime_handoff_keeps_owner_until_all_three_current_observers_exist() -> None:
@@ -454,30 +674,136 @@ def test_runtime_handoff_keeps_owner_until_all_three_current_observers_exist() -
             {
                 "region_entry_probabilities": {r2.region_id: probability},
                 "deployed_uuv_ids": {r2.region_id: r2.member_uuv_ids},
-                "passive_observer_ids": {
-                    r2.region_id: r2.member_uuv_ids[:2]
-                },
+                "passive_observer_ids": {r2.region_id: r2.member_uuv_ids[:2]},
             }
         )
     assert controller.snapshot().tracking_control.tracking_owner_group_id == r1.group_instance_id
-    assert _runtime_group_from_snapshot(
-        controller, r1.region_id
-    ).lifecycle is TaskGroupLifecycle.PASSIVE_TRACK
+    assert (
+        _runtime_group_from_snapshot(controller, r1.region_id).lifecycle
+        is TaskGroupLifecycle.PASSIVE_TRACK
+    )
 
-    snapshot = controller.observe(
+    cycle_s = controller.snapshot().sim_time_s + 10
+    snapshot = controller.advance(
+        cycle_s,
         {
-            "passive_observer_ids": {r2.region_id: r2.member_uuv_ids},
-            "deployed_uuv_ids": {r2.region_id: r2.member_uuv_ids},
-        }
+            "handoff_evidence": {
+                r1.region_id: HandoffEvidence(
+                    predecessor_region_id=r1.region_id,
+                    successor_region_id=r2.region_id,
+                    plan_revision=controller.snapshot().plan_revision,
+                    observation_cycle_s=cycle_s,
+                    required_uuv_ids=r2.member_uuv_ids,
+                    deployed_uuv_ids=r2.member_uuv_ids,
+                    healthy_uuv_ids=r2.member_uuv_ids,
+                    passive_mode_uuv_ids=r2.member_uuv_ids,
+                    accepted_observations=tuple(
+                        AcceptedHandoffObservation(
+                            observation_id=f"passive:{member_id}:{cycle_s}",
+                            observer_uuv_id=member_id,
+                            observed_at_s=cycle_s,
+                        )
+                        for member_id in r2.member_uuv_ids
+                    ),
+                )
+            }
+        },
     )
     event_types = [event.event_type for event in snapshot.events]
     assert event_types.index("tracking_ownership_transferred") < event_types.index(
         "task_group_exiting"
     )
     assert snapshot.tracking_control.tracking_owner_group_id == r2.group_instance_id
-    assert _runtime_group_from_snapshot(
-        controller, r1.region_id
-    ).lifecycle is TaskGroupLifecycle.EXITING
+    assert (
+        _runtime_group_from_snapshot(controller, r1.region_id).lifecycle
+        is TaskGroupLifecycle.EXITING
+    )
+
+
+def test_runtime_handoff_rejects_legacy_readiness_without_typed_evidence() -> None:
+    controller = _runtime_controller(
+        r1_lifecycle=TaskGroupLifecycle.PASSIVE_TRACK,
+        r1_ownership_status="owner",
+        r2_lifecycle=TaskGroupLifecycle.PASSIVE_TRACK,
+    )
+    owner = _runtime_group_from_snapshot(controller, "target_00:task:01")
+    successor = _runtime_group_from_snapshot(controller, "target_00:task:02")
+
+    snapshot = controller.observe(
+        {
+            "passive_observer_ids": {
+                successor.region_id: successor.member_uuv_ids,
+            },
+            "deployed_uuv_ids": {
+                successor.region_id: successor.member_uuv_ids,
+            },
+        }
+    )
+
+    assert snapshot.tracking_control.tracking_owner_group_id == owner.group_instance_id
+    assert snapshot.tracking_control.pending_successor_group_id == (successor.group_instance_id)
+    assert snapshot.tracking_control.handoff_blocked_reason == "handoff_evidence_missing"
+    assert not any(
+        event.event_type == "tracking_ownership_transferred" for event in snapshot.events
+    )
+
+
+def test_runtime_handoff_publishes_zero_through_three_member_readiness() -> None:
+    controller = _runtime_controller(
+        r1_lifecycle=TaskGroupLifecycle.PASSIVE_TRACK,
+        r1_ownership_status="owner",
+    )
+    owner = _runtime_group_from_snapshot(controller, "target_00:task:01")
+    successor = _runtime_group_from_snapshot(controller, "target_00:task:02")
+    for probability in (0.80, 0.81):
+        controller.observe({"region_entry_probabilities": {successor.region_id: probability}})
+
+    for ready_count in (0, 1, 2, 3):
+        cycle_s = controller.snapshot().sim_time_s + 10
+        observing = successor.member_uuv_ids[:ready_count]
+        evidence = HandoffEvidence(
+            predecessor_region_id=owner.region_id,
+            successor_region_id=successor.region_id,
+            plan_revision=controller.snapshot().plan_revision,
+            observation_cycle_s=cycle_s,
+            required_uuv_ids=successor.member_uuv_ids,
+            deployed_uuv_ids=successor.member_uuv_ids,
+            healthy_uuv_ids=successor.member_uuv_ids,
+            passive_mode_uuv_ids=successor.member_uuv_ids,
+            accepted_observations=tuple(
+                AcceptedHandoffObservation(
+                    observation_id=f"passive:{member_id}:{cycle_s}",
+                    observer_uuv_id=member_id,
+                    observed_at_s=cycle_s,
+                )
+                for member_id in observing
+            ),
+        )
+
+        snapshot = controller.advance(
+            cycle_s,
+            {"handoff_evidence": {owner.region_id: evidence}},
+        )
+
+        assert snapshot.tracking_control.successor_required_uuv_ids == (successor.member_uuv_ids)
+        assert snapshot.tracking_control.successor_observing_uuv_ids == observing
+        assert snapshot.tracking_control.handoff_observation_cycle_s == cycle_s
+        if ready_count < 3:
+            assert snapshot.tracking_control.tracking_owner_group_id == owner.group_instance_id
+            assert snapshot.tracking_control.handoff_blocked_reason == (
+                "successor_current_cycle_observations_incomplete"
+            )
+            assert (
+                _runtime_group_from_snapshot(controller, owner.region_id).lifecycle
+                is TaskGroupLifecycle.PASSIVE_TRACK
+            )
+        else:
+            assert snapshot.tracking_control.tracking_owner_group_id == successor.group_instance_id
+            assert snapshot.tracking_control.handoff_blocked_reason is None
+            assert (
+                _runtime_group_from_snapshot(controller, owner.region_id).lifecycle
+                is TaskGroupLifecycle.EXITING
+            )
 
 
 def test_runtime_handoff_waiting_preserves_owner_for_missing_successor() -> None:
@@ -487,16 +813,14 @@ def test_runtime_handoff_waiting_preserves_owner_for_missing_successor() -> None
     )
     owner_id = controller.snapshot().tracking_control.tracking_owner_group_id
 
-    snapshot = controller.observe(
-        {"target_exit_predicted": "target_00:task:01"}
-    )
+    snapshot = controller.observe({"target_exit_predicted": "target_00:task:01"})
     assert snapshot.tracking_control.tracking_owner_group_id == owner_id
-    assert _runtime_group_from_snapshot(
-        controller, "target_00:task:01"
-    ).lifecycle is TaskGroupLifecycle.PASSIVE_TRACK
+    assert (
+        _runtime_group_from_snapshot(controller, "target_00:task:01").lifecycle
+        is TaskGroupLifecycle.PASSIVE_TRACK
+    )
     assert any(
-        event.event_type == "handoff_waiting_for_passive_observation"
-        for event in snapshot.events
+        event.event_type == "handoff_waiting_for_passive_observation" for event in snapshot.events
     )
 
 
@@ -515,8 +839,7 @@ def test_runtime_handoff_requires_deployment_observation_for_all_successor_membe
 
     assert snapshot.tracking_control.tracking_owner_group_id == owner_id
     assert not any(
-        event.event_type == "tracking_ownership_transferred"
-        for event in snapshot.events
+        event.event_type == "tracking_ownership_transferred" for event in snapshot.events
     )
 
 
@@ -539,8 +862,7 @@ def test_runtime_handoff_accepts_only_adjacent_successor_group() -> None:
 
     assert snapshot.tracking_control.tracking_owner_group_id == owner_id
     assert not any(
-        event.event_type == "tracking_ownership_transferred"
-        for event in snapshot.events
+        event.event_type == "tracking_ownership_transferred" for event in snapshot.events
     )
 
 
@@ -571,9 +893,10 @@ def test_dedicated_owner_entry_requires_current_passive_owner_and_locks_whole_gr
     snapshot = controller.snapshot()
     assert snapshot.tracking_control.mode == "dedicated"
     assert snapshot.tracking_control.tracking_owner_group_id == owner.group_instance_id
-    assert _runtime_group_from_snapshot(
-        controller, owner.region_id
-    ).lifecycle is TaskGroupLifecycle.DEDICATED_TRACK
+    assert (
+        _runtime_group_from_snapshot(controller, owner.region_id).lifecycle
+        is TaskGroupLifecycle.DEDICATED_TRACK
+    )
     assert all(
         group.lifecycle is TaskGroupLifecycle.EXITING
         for group in snapshot.task_groups
@@ -584,9 +907,7 @@ def test_dedicated_owner_entry_requires_current_passive_owner_and_locks_whole_gr
         for member_id in owner.member_uuv_ids
     )
     dedicated_event = next(
-        event
-        for event in snapshot.events
-        if event.event_type == "dedicated_tracking_started"
+        event for event in snapshot.events if event.event_type == "dedicated_tracking_started"
     )
     assert dedicated_event.event_id.endswith(":d9")
     assert dedicated_event.payload["deployment_revision"] == owner.deployment_revision
@@ -602,19 +923,18 @@ def test_dedicated_release_is_triggered_once_at_remaining_mileage_threshold() ->
     owner = _runtime_group_from_snapshot(controller, "target_00:task:01")
     assert controller.set_dedicated_owner("target_00", owner.group_instance_id) is True
 
-    first = controller.observe(
-        {"mileage_m": {owner.member_uuv_ids[0]: 43_000.0}}
-    )
-    second = controller.observe(
-        {"mileage_m": {owner.member_uuv_ids[0]: 43_000.0}}
-    )
+    first = controller.observe({"mileage_m": {owner.member_uuv_ids[0]: 43_000.0}})
+    second = controller.observe({"mileage_m": {owner.member_uuv_ids[0]: 43_000.0}})
 
     assert first.tracking_control.mode == "dedicated"
-    assert next(
-        group
-        for group in first.task_groups
-        if group.group_instance_id == owner.group_instance_id
-    ).lifecycle is TaskGroupLifecycle.DEDICATED_RELEASE_PENDING
+    assert (
+        next(
+            group
+            for group in first.task_groups
+            if group.group_instance_id == owner.group_instance_id
+        ).lifecycle
+        is TaskGroupLifecycle.DEDICATED_RELEASE_PENDING
+    )
     threshold_event = next(
         event
         for event in second.events
@@ -641,38 +961,76 @@ def test_dedicated_release_restores_latest_four_groups_after_passive_observation
     owner = _runtime_group_from_snapshot(controller, "target_00:task:01")
     assert controller.set_dedicated_owner("target_00", owner.group_instance_id) is True
 
-    pending = controller.observe(
-        {"mileage_m": {owner.member_uuv_ids[0]: 43_000.0}}
-    )
+    pending = controller.observe({"mileage_m": {owner.member_uuv_ids[0]: 43_000.0}})
     successor_id = pending.tracking_control.pending_successor_group_id
     assert successor_id is not None
     successor = next(
-        group
-        for group in pending.task_groups
-        if group.group_instance_id == successor_id
+        group for group in pending.task_groups if group.group_instance_id == successor_id
     )
 
-    restored = controller.observe(
+    cycle_s = controller.snapshot().sim_time_s + 10
+    restored = controller.advance(
+        cycle_s,
         {
-            "deployed_uuv_ids": {successor.group_instance_id: successor.member_uuv_ids},
-            "passive_observer_ids": {
-                successor.group_instance_id: successor.member_uuv_ids
-            },
-        }
+            "handoff_evidence": {
+                owner.region_id: HandoffEvidence(
+                    predecessor_region_id=owner.region_id,
+                    successor_region_id=successor.region_id,
+                    plan_revision=controller.snapshot().plan_revision,
+                    observation_cycle_s=cycle_s,
+                    required_uuv_ids=successor.member_uuv_ids,
+                    deployed_uuv_ids=successor.member_uuv_ids,
+                    healthy_uuv_ids=successor.member_uuv_ids,
+                    passive_mode_uuv_ids=successor.member_uuv_ids,
+                    accepted_observations=tuple(
+                        AcceptedHandoffObservation(
+                            observation_id=f"passive:{member_id}:{cycle_s}",
+                            observer_uuv_id=member_id,
+                            observed_at_s=cycle_s,
+                        )
+                        for member_id in successor.member_uuv_ids
+                    ),
+                )
+            }
+        },
     )
 
+    latest_revision = max(group.deployment_revision for group in restored.task_groups)
+    latest_groups = tuple(
+        group for group in restored.task_groups if group.deployment_revision == latest_revision
+    )
+    groups_by_id = {group.group_instance_id: group for group in restored.task_groups}
     assert restored.tracking_control.mode == "regional"
     assert restored.tracking_control.tracking_owner_group_id == successor_id
-    assert next(
-        group for group in restored.task_groups if group.group_instance_id == successor_id
-    ).lifecycle is TaskGroupLifecycle.PASSIVE_TRACK
-    assert next(
-        group for group in restored.task_groups if group.group_instance_id == owner.group_instance_id
-    ).lifecycle is TaskGroupLifecycle.EXITING
-    assert any(
-        event.event_type == "regional_mode_restored"
-        for event in restored.events
+    assert len(latest_groups) == 4
+    assert {group.region_id for group in latest_groups} == {
+        f"target_00:task:{slot:02d}" for slot in range(1, 5)
+    }
+    assert all(
+        group.source_group_instance_id in groups_by_id
+        and groups_by_id[group.source_group_instance_id].region_id == group.region_id
+        for group in latest_groups
     )
+    owners = tuple(group for group in restored.task_groups if group.ownership_status == "owner")
+    assert len(owners) == 1
+    assert owners[0].group_instance_id == successor_id
+    assert owners[0].sensor_mode is GroupSensorMode.PASSIVE
+    assert len(owners[0].member_uuv_ids) == 3
+    assert (
+        next(
+            group for group in restored.task_groups if group.group_instance_id == successor_id
+        ).lifecycle
+        is TaskGroupLifecycle.PASSIVE_TRACK
+    )
+    assert (
+        next(
+            group
+            for group in restored.task_groups
+            if group.group_instance_id == owner.group_instance_id
+        ).lifecycle
+        is TaskGroupLifecycle.EXITING
+    )
+    assert any(event.event_type == "regional_mode_restored" for event in restored.events)
 
 
 def test_dedicated_refresh_does_not_release_before_mileage_threshold() -> None:
@@ -690,9 +1048,7 @@ def test_dedicated_refresh_does_not_release_before_mileage_threshold() -> None:
             "execution_revision": current.execution_revision + 1,
             "base_execution_revision": current.execution_revision,
             "regions": tuple(
-                region.model_copy(
-                    update={"execution_revision": current.execution_revision + 1}
-                )
+                region.model_copy(update={"execution_revision": current.execution_revision + 1})
                 for region in current.regions
             ),
         },
@@ -708,6 +1064,21 @@ def test_runtime_snapshot_reconcile_preserves_group_progress_across_refresh() ->
     controller = _runtime_controller(
         r1_lifecycle=TaskGroupLifecycle.PASSIVE_TRACK,
         r1_ownership_status="owner",
+    )
+    active_group = _runtime_group_from_snapshot(controller, "target_00:task:02")
+    controller.observe(
+        {
+            "runtime_scan_states": {
+                active_group.region_id: {
+                    "group_instance_id": active_group.group_instance_id,
+                    "coverage": 0.96,
+                    "route_progress": 0.75,
+                    "scan_round": 2,
+                    "ping_count": 7,
+                    "evidence_ids": tuple(f"active_ping:preserved:{index}" for index in range(7)),
+                }
+            }
+        }
     )
     current = controller.snapshot()
     owner_id = current.tracking_control.tracking_owner_group_id
@@ -729,17 +1100,27 @@ def test_runtime_snapshot_reconcile_preserves_group_progress_across_refresh() ->
 
     assert reconciled.plan_revision == 10
     assert reconciled.tracking_control.tracking_owner_group_id == owner_id
-    assert _runtime_group_from_snapshot(
-        controller, "target_00:task:01"
-    ).lifecycle is TaskGroupLifecycle.PASSIVE_TRACK
+    assert (
+        _runtime_group_from_snapshot(controller, "target_00:task:01").lifecycle
+        is TaskGroupLifecycle.PASSIVE_TRACK
+    )
+    active_region = next(
+        region for region in reconciled.regions if region.region_id == active_group.region_id
+    )
+    assert active_region.coverage == pytest.approx(0.96)
+    assert active_region.route_progress == pytest.approx(0.75)
+    assert active_region.scan_round == 2
+    assert active_region.ping_count == 7
+    assert active_region.scan_completed is True
+    assert active_region.scan_evidence_ids == tuple(
+        f"active_ping:preserved:{index}" for index in range(7)
+    )
 
 
 def test_runtime_reconcile_reuses_groups_when_only_prediction_metadata_changes() -> None:
     controller = _runtime_controller()
     before = controller.snapshot()
-    before_ids = {
-        group.region_id: group.group_instance_id for group in before.task_groups
-    }
+    before_ids = {group.region_id: group.group_instance_id for group in before.task_groups}
     base = controller.runtime_execution_snapshot(_execution_snapshot())
     candidate = base.model_copy(
         deep=True,
@@ -768,6 +1149,82 @@ def test_runtime_reconcile_reuses_groups_when_only_prediction_metadata_changes()
     assert controller.replacement_states == ()
 
 
+def test_runtime_reconcile_preserves_group_identity_when_members_are_unchanged() -> None:
+    controller = _runtime_controller()
+    before = controller.snapshot()
+    before_ids = {
+        group.region_id: group.group_instance_id for group in before.task_groups
+    }
+    base = controller.runtime_execution_snapshot(_execution_snapshot())
+    candidate_groups = tuple(
+        group.model_copy(
+            update={
+                "group_instance_id": f"candidate:{group.region_id}",
+                "deployment_revision": group.deployment_revision + 1,
+            }
+        )
+        for group in base.task_groups
+    )
+    candidate_regions = tuple(
+        region.model_copy(
+            update={
+                "execution_revision": base.execution_revision + 1,
+                "center": (region.center[0] + 100.0, region.center[1] + 100.0),
+                "geometry": tuple(
+                    (point[0] + 100.0, point[1] + 100.0)
+                    for point in region.geometry
+                ),
+                "geometry_revision": region.geometry_revision + 1,
+                "task_group_id": candidate_groups[index].group_instance_id,
+            }
+        )
+        for index, region in enumerate(base.regions)
+    )
+    candidate = base.model_copy(
+        deep=True,
+        update={
+            "execution_revision": base.execution_revision + 1,
+            "base_execution_revision": base.execution_revision,
+            "regions": candidate_regions,
+            "task_groups": candidate_groups,
+        },
+    )
+
+    reconciled = controller.reconcile_execution_snapshot(candidate)
+
+    assert {
+        group.region_id: group.group_instance_id for group in reconciled.task_groups
+    } == before_ids
+def test_runtime_reconcile_does_not_replace_same_group_when_geometry_projection_lags() -> None:
+    controller = _runtime_controller()
+    current = controller.runtime_execution_snapshot(_execution_snapshot())
+    current_groups = {group.region_id: group for group in current.task_groups}
+    shifted = _runtime_replacement_snapshot(
+        current,
+        revision=current.execution_revision + 1,
+    )
+    candidate = shifted.model_copy(
+        deep=True,
+        update={
+            "regions": tuple(
+                region.model_copy(
+                    update={"task_group_id": current_groups[region.region_id].group_instance_id}
+                )
+                for region in shifted.regions
+            ),
+            "task_groups": tuple(current_groups.values()),
+        },
+    ).validate_snapshot()
+
+    reconciled = controller.reconcile_execution_snapshot(candidate)
+
+    assert reconciled.plan_revision == candidate.execution_revision
+    assert {group.group_instance_id for group in reconciled.task_groups} == {
+        group.group_instance_id for group in current.task_groups
+    }
+    assert controller.replacement_states == ()
+
+
 def test_four_changed_regions_keep_old_and_new_groups_visible() -> None:
     controller = _runtime_controller()
     current = controller.runtime_execution_snapshot(_execution_snapshot())
@@ -784,17 +1241,168 @@ def test_four_changed_regions_keep_old_and_new_groups_visible() -> None:
     ]
 
     assert len(waterborne) == 8
-    assert sum(
-        group.lifecycle is TaskGroupLifecycle.ENTERING for group in waterborne
-    ) == 4
-    assert sum(
-        group.lifecycle is TaskGroupLifecycle.EXITING for group in waterborne
-    ) == 4
+    assert sum(group.lifecycle is TaskGroupLifecycle.ENTERING for group in waterborne) == 4
+    assert not any(group.lifecycle is TaskGroupLifecycle.EXITING for group in waterborne)
+    assert sum(group.lifecycle is TaskGroupLifecycle.ACTIVE_SCAN for group in waterborne) == 4
     assert len(controller.replacement_states) == 4
 
 
-def test_region_replacement_completion_releases_outgoing_resources_and_identity() -> None:
+def test_four_changed_regions_allocate_unique_incoming_deployment_members() -> None:
     controller = _runtime_controller()
+    current = controller.runtime_execution_snapshot(_execution_snapshot())
+    current_by_region = {group.region_id: group for group in current.task_groups}
+    replacement = _runtime_replacement_snapshot(
+        current,
+        revision=current.execution_revision + 1,
+    )
+    candidate = replacement.model_copy(
+        deep=True,
+        update={
+            "task_groups": tuple(
+                group.model_copy(
+                    update={"member_uuv_ids": current_by_region[group.region_id].member_uuv_ids}
+                )
+                for group in replacement.task_groups
+            )
+        },
+    ).validate_snapshot()
+
+    reconciled = controller.reconcile_execution_snapshot(candidate)
+    waterborne = tuple(
+        group
+        for group in reconciled.task_groups
+        if group.lifecycle is not TaskGroupLifecycle.DISAPPEARED
+    )
+    member_ids = tuple(member_id for group in waterborne for member_id in group.member_uuv_ids)
+
+    assert reconciled.plan_revision == candidate.execution_revision
+    assert len(waterborne) == 8
+    assert len(member_ids) == 24
+    assert len(set(member_ids)) == 24
+    assert {
+        (state.outgoing_group_id, state.incoming_group_id)
+        for state in controller.replacement_states
+    } == {
+        (
+            current_by_region[region.region_id].group_instance_id,
+            next(
+                group.group_instance_id
+                for group in replacement.task_groups
+                if group.region_id == region.region_id
+            ),
+        )
+        for region in current.regions
+    }
+
+
+def test_replacement_region_rekeys_independent_routes_to_incoming_members() -> None:
+    controller = _runtime_controller()
+    current = controller.runtime_execution_snapshot(_execution_snapshot())
+    first_candidate = _runtime_replacement_snapshot(
+        current,
+        revision=current.execution_revision + 1,
+    )
+    first_reconciled = controller.reconcile_execution_snapshot(first_candidate)
+    incoming = next(
+        group
+        for group in first_reconciled.task_groups
+        if group.region_id == "target_00:task:01"
+        and group.lifecycle is TaskGroupLifecycle.ENTERING
+    )
+    controller.observe(
+        {"deployed_uuv_ids": {incoming.group_instance_id: incoming.member_uuv_ids}}
+    )
+    controller.observe(
+        {
+            "runtime_scan_states": {
+                incoming.region_id: {
+                    "group_instance_id": incoming.group_instance_id,
+                    "coverage": 0.10,
+                    "route_progress": 0.0,
+                    "scan_round": 0,
+                    "ping_count": 1,
+                    "evidence_ids": ("active_ping:incoming",),
+                }
+            }
+        }
+    )
+    second_candidate = _runtime_replacement_snapshot(
+        first_candidate,
+        revision=first_candidate.execution_revision + 1,
+    )
+
+    reconciled = controller.reconcile_execution_snapshot(second_candidate)
+
+    for region in reconciled.regions:
+        selected = next(
+            group
+            for group in reconciled.task_groups
+            if group.group_instance_id == region.task_group_id
+        )
+        assert set(region.scan_waypoints_by_uuv) == set(selected.member_uuv_ids)
+        first_points = tuple(
+            region.scan_waypoints_by_uuv[member_id][0]
+            for member_id in selected.member_uuv_ids
+        )
+        assert len(set(first_points)) == len(first_points)
+
+
+def test_non_executable_candidate_preserves_complete_runtime_state() -> None:
+    controller = _runtime_controller()
+    controller.observe(
+        {
+            "region_entry_probabilities": {
+                "target_00:task:01": 0.71,
+            }
+        }
+    )
+    before = controller.snapshot()
+    before_replacements = controller.replacement_states
+    current = controller.runtime_execution_snapshot(_execution_snapshot())
+    candidate = _runtime_replacement_snapshot(
+        current,
+        revision=current.execution_revision + 1,
+    ).model_copy(update={"valid_from_s": 901.0, "valid_until_s": 1351.0})
+
+    reconciled = controller.reconcile_execution_snapshot(candidate)
+
+    assert reconciled == before
+    assert controller.replacement_states == before_replacements
+
+
+def test_owner_region_preserves_outgoing_progress_until_incoming_takeover() -> None:
+    controller = _runtime_controller()
+    region_id = "target_00:task:01"
+    first_cycle_s = controller.snapshot().sim_time_s + 10
+    controller.advance(
+        first_cycle_s,
+        {"region_entry_probabilities": {region_id: 0.80}},
+    )
+    owned = controller.advance(
+        first_cycle_s + 10,
+        {"region_entry_probabilities": {region_id: 0.81}},
+    )
+    outgoing = _runtime_group_from_snapshot(controller, region_id)
+    assert owned.tracking_control.tracking_owner_group_id == (outgoing.group_instance_id)
+    controller.advance(
+        first_cycle_s + 10,
+        {
+            "evaluate_entry_observation": False,
+            "runtime_scan_states": {
+                region_id: {
+                    "group_instance_id": outgoing.group_instance_id,
+                    "coverage": 0.60,
+                    "route_progress": 0.50,
+                    "scan_round": 1,
+                    "ping_count": 2,
+                    "evidence_ids": (
+                        "active_ping:outgoing:1",
+                        "active_ping:outgoing:2",
+                    ),
+                }
+            },
+        },
+    )
     current = controller.runtime_execution_snapshot(_execution_snapshot())
     candidate = _runtime_replacement_snapshot(
         current,
@@ -802,34 +1410,189 @@ def test_region_replacement_completion_releases_outgoing_resources_and_identity(
         shifted_slots=(0,),
     )
     reconciled = controller.reconcile_execution_snapshot(candidate)
-    outgoing = next(
-        group
-        for group in reconciled.task_groups
-        if group.region_id == "target_00:task:01"
-        and group.lifecycle is TaskGroupLifecycle.EXITING
-    )
     incoming = next(
         group
         for group in reconciled.task_groups
-        if group.region_id == "target_00:task:01"
-        and group.lifecycle is not TaskGroupLifecycle.EXITING
+        if group.region_id == region_id
+        and group.source_group_instance_id == outgoing.group_instance_id
     )
+    controller.advance(
+        first_cycle_s + 20,
+        {
+            "evaluate_entry_observation": False,
+            "deployed_uuv_ids": {
+                incoming.group_instance_id: incoming.member_uuv_ids,
+            },
+        },
+    )
+
+    observed = controller.advance(
+        first_cycle_s + 30,
+        {
+            "evaluate_entry_observation": False,
+            "runtime_scan_states": {
+                region_id: {
+                    "group_instance_id": incoming.group_instance_id,
+                    "coverage": 0.10,
+                    "route_progress": 0.0,
+                    "scan_round": 0,
+                    "ping_count": 1,
+                    "evidence_ids": ("active_ping:incoming",),
+                }
+            },
+        },
+    )
+
+    region = next(item for item in observed.regions if item.region_id == region_id)
+    preserved_outgoing = next(
+        group
+        for group in observed.task_groups
+        if group.group_instance_id == outgoing.group_instance_id
+    )
+    assert region.task_group_id == outgoing.group_instance_id
+    assert region.coverage == pytest.approx(0.60)
+    assert region.route_progress == pytest.approx(0.50)
+    assert region.scan_round == 1
+    assert region.ping_count == 2
+    assert preserved_outgoing.ownership_status == "owner"
+    assert preserved_outgoing.lifecycle is TaskGroupLifecycle.PASSIVE_TRACK
+
+
+def test_region_replacement_completion_releases_outgoing_resources_and_identity() -> None:
+    controller = _runtime_controller()
     controller.observe(
         {
-            "mileage_m": {
-                member_id: 321.0 for member_id in outgoing.member_uuv_ids
+            "runtime_scan_states": {
+                "target_00:task:01": {
+                    "group_instance_id": _runtime_group_from_snapshot(
+                        controller, "target_00:task:01"
+                    ).group_instance_id,
+                    "coverage": 0.60,
+                    "route_progress": 0.50,
+                    "scan_round": 1,
+                    "ping_count": 2,
+                    "evidence_ids": (
+                        "active_ping:outgoing:1",
+                        "active_ping:outgoing:2",
+                    ),
+                }
             }
         }
     )
+    current = controller.runtime_execution_snapshot(_execution_snapshot())
+    candidate = _runtime_replacement_snapshot(
+        current,
+        revision=current.execution_revision + 1,
+        shifted_slots=(0,),
+    )
+    reconciled = controller.reconcile_execution_snapshot(candidate)
+    incoming = next(
+        group
+        for group in reconciled.task_groups
+        if group.region_id == "target_00:task:01" and group.source_group_instance_id is not None
+    )
+    outgoing = next(
+        group
+        for group in reconciled.task_groups
+        if group.group_instance_id == incoming.source_group_instance_id
+    )
+    assert outgoing.lifecycle is TaskGroupLifecycle.ACTIVE_SCAN
+    assert (
+        next(
+            region for region in reconciled.regions if region.region_id == incoming.region_id
+        ).task_group_id
+        == outgoing.group_instance_id
+    )
+    controller.observe(
+        {
+            "deployed_uuv_ids": {
+                incoming.group_instance_id: incoming.member_uuv_ids,
+            }
+        }
+    )
+    controller.observe(
+        {
+            "runtime_scan_states": {
+                incoming.region_id: {
+                    "group_instance_id": incoming.group_instance_id,
+                    "coverage": 0.0,
+                    "route_progress": 0.0,
+                    "scan_round": 0,
+                    "ping_count": 0,
+                    "evidence_ids": (),
+                }
+            }
+        }
+    )
+    assert (
+        controller.snapshot()
+        .task_groups[
+            tuple(group.group_instance_id for group in controller.snapshot().task_groups).index(
+                outgoing.group_instance_id
+            )
+        ]
+        .lifecycle
+        is TaskGroupLifecycle.ACTIVE_SCAN
+    )
+    assert (
+        next(
+            region
+            for region in controller.snapshot().regions
+            if region.region_id == incoming.region_id
+        ).task_group_id
+        == outgoing.group_instance_id
+    )
+    preserved_region = next(
+        region
+        for region in controller.snapshot().regions
+        if region.region_id == incoming.region_id
+    )
+    assert preserved_region.coverage == pytest.approx(0.60)
+    assert preserved_region.route_progress == pytest.approx(0.50)
+    assert preserved_region.scan_round == 1
+    assert preserved_region.ping_count == 2
+    controller.observe(
+        {
+            "runtime_scan_states": {
+                incoming.region_id: {
+                    "group_instance_id": incoming.group_instance_id,
+                    "coverage": 0.10,
+                    "route_progress": 0.0,
+                    "scan_round": 0,
+                    "ping_count": 1,
+                    "evidence_ids": ("active_ping:incoming",),
+                }
+            }
+        }
+    )
+    outgoing = next(
+        group
+        for group in controller.snapshot().task_groups
+        if group.group_instance_id == outgoing.group_instance_id
+    )
+    assert outgoing.lifecycle is TaskGroupLifecycle.EXITING
+    replacement_region = next(
+        region for region in controller.snapshot().regions if region.region_id == incoming.region_id
+    )
+    assert replacement_region.task_group_id == incoming.group_instance_id
+    assert replacement_region.coverage == pytest.approx(0.10)
+    assert replacement_region.route_progress == pytest.approx(0.0)
+    assert replacement_region.scan_round == 0
+    assert replacement_region.ping_count == 1
+    assert replacement_region.scan_evidence_ids == ("active_ping:incoming",)
+    controller.observe({"mileage_m": {member_id: 321.0 for member_id in outgoing.member_uuv_ids}})
     before_episodes = {
         member_id: controller.snapshot().resource_episode_by_uuv.get(member_id, 0)
         for member_id in outgoing.member_uuv_ids
     }
 
-    assert controller.complete_region_replacement(
-        outgoing.region_id,
-        incoming_group_id=incoming.group_instance_id,
-    ) is True
+    assert (
+        controller.complete_region_replacement(
+            outgoing.region_id,
+            incoming_group_id=incoming.group_instance_id,
+        )
+        is True
+    )
 
     snapshot = controller.snapshot()
     assert outgoing.group_instance_id not in {
@@ -842,7 +1605,8 @@ def test_region_replacement_completion_releases_outgoing_resources_and_identity(
         assert snapshot.uuv_resources[member_id].energy_fraction == 1.0
         assert snapshot.resource_episode_by_uuv[member_id] == before_episodes[member_id] + 1
     disappeared = next(
-        event for event in snapshot.events
+        event
+        for event in snapshot.events
         if event.event_type == "task_group_disappeared"
         and event.entity_id == outgoing.group_instance_id
     )
@@ -880,8 +1644,8 @@ def test_runtime_reconcile_keeps_one_pair_and_latest_pending_region() -> None:
     )
     assert all(
         state.latest_pending_region is not None
-        and state.target_geometry_revision
-        == state.latest_pending_region.geometry_revision
+        and state.target_geometry_revision < state.latest_pending_region.geometry_revision
+        and state.latest_pending_group is not None
         for state in controller.replacement_states
     )
     assert all(
@@ -889,6 +1653,230 @@ def test_runtime_reconcile_keeps_one_pair_and_latest_pending_region() -> None:
         and state.latest_pending_region.execution_revision == third.execution_revision
         for state in controller.replacement_states
     )
+
+    region_id = third.regions[0].region_id
+    active_state = next(
+        state for state in controller.replacement_states if state.region_id == region_id
+    )
+    first_incoming_id = active_state.incoming_group_id
+    latest_group = next(group for group in third.task_groups if group.region_id == region_id)
+    first_incoming = next(
+        group
+        for group in controller.snapshot().task_groups
+        if group.group_instance_id == first_incoming_id
+    )
+    controller.observe(
+        {
+            "deployed_uuv_ids": {
+                first_incoming.group_instance_id: first_incoming.member_uuv_ids,
+            },
+            "evaluate_entry_observation": False,
+        }
+    )
+    controller.observe(
+        {
+            "runtime_scan_states": {
+                region_id: {
+                    "group_instance_id": first_incoming_id,
+                    "coverage": 0.10,
+                    "route_progress": 0.0,
+                    "scan_round": 0,
+                    "ping_count": 1,
+                    "evidence_ids": ("active_ping:first-incoming",),
+                }
+            }
+        }
+    )
+
+    assert controller.complete_region_replacement(
+        region_id,
+        incoming_group_id=first_incoming_id,
+    )
+    queued = next(state for state in controller.replacement_states if state.region_id == region_id)
+    assert queued.outgoing_group_id == first_incoming_id
+    assert queued.incoming_group_id == latest_group.group_instance_id
+    assert queued.latest_pending_region is None
+    assert queued.latest_pending_group is None
+    assert len(controller.snapshot().task_groups) == 8
+
+
+def test_runtime_reconcile_coalesces_latest_geometry_into_live_incoming_group() -> None:
+    controller = _runtime_controller()
+    current = controller.runtime_execution_snapshot(_execution_snapshot())
+    first = _runtime_replacement_snapshot(
+        current,
+        revision=current.execution_revision + 1,
+        shift_m=100.0,
+    )
+    second = _runtime_replacement_snapshot(
+        first,
+        revision=first.execution_revision + 1,
+        shift_m=200.0,
+    )
+    latest = _runtime_replacement_snapshot(
+        second,
+        revision=second.execution_revision + 1,
+        shift_m=300.0,
+    )
+
+    controller.reconcile_execution_snapshot(
+        first,
+        coalesce_pending_geometry=True,
+    )
+    controller.reconcile_execution_snapshot(
+        second,
+        coalesce_pending_geometry=True,
+    )
+    controller.reconcile_execution_snapshot(
+        latest,
+        coalesce_pending_geometry=True,
+    )
+
+    region_id = latest.regions[0].region_id
+    state = next(
+        item for item in controller.replacement_states if item.region_id == region_id
+    )
+    incoming_id = state.incoming_group_id
+    incoming = next(
+        group
+        for group in controller.snapshot().task_groups
+        if group.group_instance_id == incoming_id
+    )
+    controller.observe(
+        {
+            "deployed_uuv_ids": {
+                incoming.group_instance_id: incoming.member_uuv_ids,
+            },
+            "evaluate_entry_observation": False,
+        }
+    )
+    controller.observe(
+        {
+            "runtime_scan_states": {
+                region_id: {
+                    "group_instance_id": incoming_id,
+                    "coverage": 0.10,
+                    "route_progress": 0.0,
+                    "scan_round": 0,
+                    "ping_count": 1,
+                    "evidence_ids": ("active_ping:coalesced-incoming",),
+                }
+            }
+        }
+    )
+
+    assert controller.complete_region_replacement(
+        region_id,
+        incoming_group_id=incoming_id,
+    )
+    assert not any(item.region_id == region_id for item in controller.replacement_states)
+    assert incoming_id in {
+        group.group_instance_id for group in controller.snapshot().task_groups
+    }
+    projected = controller.runtime_execution_snapshot(latest)
+    projected_region = next(
+        region for region in projected.regions if region.region_id == region_id
+    )
+    latest_region = next(region for region in latest.regions if region.region_id == region_id)
+    assert projected_region.geometry_revision == latest_region.geometry_revision
+
+    refreshed = _runtime_replacement_snapshot(
+        latest,
+        revision=latest.execution_revision + 1,
+        shift_m=400.0,
+    )
+    controller.reconcile_execution_snapshot(
+        refreshed,
+        coalesce_pending_geometry=True,
+    )
+    assert not any(item.region_id == region_id for item in controller.replacement_states)
+    assert incoming_id in {
+        group.group_instance_id for group in controller.snapshot().task_groups
+    }
+    refreshed_projection = controller.runtime_execution_snapshot(refreshed)
+    refreshed_region = next(
+        region for region in refreshed_projection.regions if region.region_id == region_id
+    )
+    refreshed_source = next(
+        region for region in refreshed.regions if region.region_id == region_id
+    )
+    assert refreshed_region.geometry_revision == refreshed_source.geometry_revision
+
+
+def test_runtime_replacement_consumes_same_group_geometry_refresh() -> None:
+    controller = _runtime_controller()
+    current = controller.runtime_execution_snapshot(_execution_snapshot())
+    first = _runtime_replacement_snapshot(
+        current,
+        revision=current.execution_revision + 1,
+        shift_m=100.0,
+    )
+    controller.reconcile_execution_snapshot(first)
+    region_id = first.regions[0].region_id
+    state = next(
+        item for item in controller.replacement_states if item.region_id == region_id
+    )
+    incoming = next(
+        group
+        for group in controller.snapshot().task_groups
+        if group.group_instance_id == state.incoming_group_id
+    )
+    next_revision = first.execution_revision + 1
+    refreshed_regions = tuple(
+        region.model_copy(
+            update={
+                "execution_revision": next_revision,
+                "geometry_revision": region.geometry_revision + 1,
+                "center": (region.center[0] + 25.0, region.center[1]),
+                "geometry": tuple((x + 25.0, y) for x, y in region.geometry),
+            }
+        )
+        for region in first.regions
+    )
+    refreshed = first.model_copy(
+        deep=True,
+        update={
+            "execution_revision": next_revision,
+            "base_execution_revision": first.execution_revision,
+            "regions": refreshed_regions,
+        },
+    )
+    controller.reconcile_execution_snapshot(refreshed)
+    controller.observe(
+        {
+            "deployed_uuv_ids": {
+                incoming.group_instance_id: incoming.member_uuv_ids,
+            },
+            "evaluate_entry_observation": False,
+        }
+    )
+    controller.observe(
+        {
+            "runtime_scan_states": {
+                region_id: {
+                    "group_instance_id": incoming.group_instance_id,
+                    "coverage": 0.10,
+                    "route_progress": 0.0,
+                    "scan_round": 0,
+                    "ping_count": 1,
+                    "evidence_ids": ("active_ping:incoming",),
+                }
+            }
+        }
+    )
+
+    assert controller.complete_region_replacement(
+        region_id,
+        incoming_group_id=incoming.group_instance_id,
+    )
+    assert not any(
+        item.region_id == region_id for item in controller.replacement_states
+    )
+    projected = controller.runtime_execution_snapshot(refreshed)
+    projected_region = next(
+        region for region in projected.regions if region.region_id == region_id
+    )
+    assert projected_region.geometry_revision == refreshed_regions[0].geometry_revision
 
 
 def test_runtime_execution_snapshot_projects_controller_groups_and_control() -> None:
@@ -1617,8 +2605,7 @@ def test_completed_region_rotates_uuvs_at_resource_warning_without_erasing_assig
     assert snapshot.uuv_modes["U2"] is UUVMissionMode.RETURN_REQUIRED
     assert snapshot.carrier_missions["carrier_01"].recoverable_uuv_ids == ("U1", "U2")
     assert any(
-        event.event_type == "endurance_threshold_crossed"
-        and event.entity_id == "U1"
+        event.event_type == "endurance_threshold_crossed" and event.entity_id == "U1"
         for event in snapshot.events
     )
     completed = next(region for region in snapshot.regions if region.region_id == "R1")
@@ -1821,9 +2808,7 @@ def test_rolling_refresh_does_not_preserve_pending_handoff_after_topology_change
     )
 
     assert controller.apply_verified_plan(rolling_plan) is True
-    region = next(
-        region for region in controller.snapshot().regions if region.region_id == "R1"
-    )
+    region = next(region for region in controller.snapshot().regions if region.region_id == "R1")
     assert region.lifecycle is RegionLifecycle.PLANNED
 
 

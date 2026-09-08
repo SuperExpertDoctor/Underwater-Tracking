@@ -7,7 +7,11 @@ import pytest
 
 from underwater_tracking.domain.agent_models import DecisionRecord, StrategyProposal
 from underwater_tracking.domain.memory_models import MemoryWorkPayload
-from underwater_tracking.memory.source_reader import MemorySourceReader, _bounded_text
+from underwater_tracking.memory.source_reader import (
+    MemorySourceReader,
+    _bounded_text,
+    tracking_episode_kind,
+)
 from underwater_tracking.persistence.events import EventRepository
 from underwater_tracking.persistence.ledger import DecisionLedger
 from underwater_tracking.persistence.memory import (
@@ -130,6 +134,37 @@ def test_source_reader_preserves_public_quality_evidence(tmp_path: Path) -> None
     assert "covariance" in source.text
 
 
+def test_source_reader_drops_nested_truth_fields_from_allowed_event_values(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "memory.db"
+    events = EventRepository(database)
+    memory = LongTermMemoryRepository(database)
+    events.append(
+        event_id="nested-evaluation-field",
+        event_type="bearing",
+        scenario_id="scenario-1",
+        sim_time_s=30,
+        payload={
+            "summary": "public bearing evidence",
+            "previous": {
+                "label": "transit",
+                "truth_position": (1.0, 2.0),
+                "groundTruth": {"x": 1.0},
+            },
+        },
+    )
+
+    source = MemorySourceReader(memory, event_repository=events).read_new(
+        "operator", "scenario-1"
+    )[0]
+
+    serialized = json.dumps(source.payload, ensure_ascii=True, sort_keys=True)
+    assert "truth_position" not in serialized
+    assert "groundTruth" not in serialized
+    assert source.payload["previous"] == {"label": "transit"}
+
+
 def test_source_reader_preserves_execution_context_from_event_evidence(tmp_path: Path) -> None:
     database = tmp_path / "memory.db"
     events = EventRepository(database)
@@ -154,6 +189,106 @@ def test_source_reader_preserves_execution_context_from_event_evidence(tmp_path:
     assert source.frame_id == 42
     assert source.payload["execution_revision"] == 7
     assert source.payload["frame_id"] == 42
+
+
+def test_source_reader_routes_tracking_episode_events_with_public_provenance(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "memory.db"
+    events = EventRepository(database)
+    memory = LongTermMemoryRepository(database)
+    events.append(
+        event_id="execution-expired",
+        event_type="execution_snapshot_expired",
+        scenario_id="scenario-1",
+        sim_time_s=300,
+        payload={"execution_revision": 4, "reason": "expired"},
+    )
+
+    source = MemorySourceReader(memory, event_repository=events).read_new(
+        "operator", "scenario-1"
+    )[0]
+
+    assert tracking_episode_kind("execution_snapshot_expired") == "execution_recovery"
+    assert source.memory_eligible is True
+    assert source.episode_kind == "execution_recovery"
+    assert source.source_event_ids == ("execution-expired",)
+    assert "execution_snapshot_expired" in source.text
+
+
+def test_source_reader_routes_refresh_waiting_events_to_recovery_episode(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "memory.db"
+    events = EventRepository(database)
+    memory = LongTermMemoryRepository(database)
+    events.append(
+        event_id="refresh-waiting",
+        event_type="execution_refresh_waiting_for_source",
+        scenario_id="scenario-1",
+        sim_time_s=1_200,
+        payload={
+            "execution_revision": 35,
+            "candidate_execution_revision": 36,
+            "reason_code": "public_source_expired",
+        },
+    )
+
+    source = MemorySourceReader(memory, event_repository=events).read_new(
+        "operator", "scenario-1"
+    )[0]
+
+    assert tracking_episode_kind("execution_refresh_waiting_for_source") == (
+        "execution_recovery"
+    )
+    assert source.memory_eligible is True
+    assert source.episode_kind == "execution_recovery"
+    assert source.source_event_ids == ("refresh-waiting",)
+
+
+def test_source_reader_preserves_refresh_and_recovery_provenance(tmp_path: Path) -> None:
+    database = tmp_path / "memory.db"
+    events = EventRepository(database)
+    memory = LongTermMemoryRepository(database)
+    events.append(
+        event_id="refresh-recovered",
+        event_type="execution_snapshot_recovered",
+        scenario_id="scenario-1",
+        sim_time_s=1_260,
+        payload={
+            "attempt_id": "refresh:scenario-1:3",
+            "refresh_status": "recovering",
+            "reason_code": "recovery_committed",
+            "execution_revision": 36,
+            "candidate_execution_revision": 36,
+            "source_snapshot_revision": 13,
+            "prediction_revision": 22,
+            "expired_execution_revision": 35,
+            "recovered_execution_revision": 36,
+            "execution_health_status": "current",
+            "execution_health_reasons": ["recovery_committed"],
+            "recovery_latency_s": 30.0,
+            "raw_prompt": "must not be retained",
+        },
+    )
+
+    source = MemorySourceReader(memory, event_repository=events).read_new(
+        "operator", "scenario-1"
+    )[0]
+
+    assert source.payload["attempt_id"] == "refresh:scenario-1:3"
+    assert source.payload["refresh_status"] == "recovering"
+    assert source.payload["reason_code"] == "recovery_committed"
+    assert source.payload["candidate_execution_revision"] == 36
+    assert source.payload["source_snapshot_revision"] == 13
+    assert source.payload["prediction_revision"] == 22
+    assert source.payload["expired_execution_revision"] == 35
+    assert source.payload["recovered_execution_revision"] == 36
+    assert source.payload["execution_health_status"] == "current"
+    assert source.payload["execution_health_reasons"] == ["recovery_committed"]
+    assert source.payload["recovery_latency_s"] == 30.0
+    assert "raw_prompt" not in source.payload
+    assert "raw_prompt" not in source.text
 
 
 def test_source_reader_projects_periodic_summary_text_and_event_provenance(

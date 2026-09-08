@@ -87,6 +87,7 @@ from underwater_tracking.world_model.adapter import (
     build_world_model_forecasts,
     contact_association_snapshot,
 )
+from underwater_tracking.world_model.models import WorldModelForecast
 from underwater_tracking.runtime.execution_evidence import (
     ExecutionEvidenceResolver,
     answer_execution_question,
@@ -360,6 +361,7 @@ class CarrierRuntime:
                 previous_tracking = dict(
                     getattr(self, "_world_model_tracking_history", {})
                 )
+                self._world_model_previous_tracking = previous_tracking
                 result["world_model_forecasts"] = build_world_model_forecasts(
                     situation,
                     result.get("predictions") or {},
@@ -367,6 +369,8 @@ class CarrierRuntime:
                     active_plan=active_plan,
                     previous_tracking_by_target=previous_tracking,
                     source_plan_revision=source_plan_revision,
+                    execution_snapshot=execution_snapshot,
+                    accepted_predictions=result.get("accepted_predictions") or {},
                 )
                 self._world_model_tracking_history = {
                     target_id: contact_association_snapshot(situation, target_id)
@@ -399,6 +403,35 @@ class CarrierRuntime:
                 )
                 self._live_prediction_pending_events.append(event)
             return dict(self._live_prediction_state)
+
+    def world_model_forecasts_for_publication(
+        self,
+        situation: SituationSnapshot,
+        execution_snapshot: OperationalExecutionSnapshot | None = None,
+    ) -> dict[str, WorldModelForecast]:
+        """Rebind read-only events after the execution commit, before all transports.
+
+        This performs no planning, controller calls or observation updates. The
+        authoritative line and owner/region context are sampled in one call.
+        """
+        config = getattr(self._dependencies, "world_model_config", None)
+        if config is None or not config.enabled:
+            return {}
+        with self._live_prediction_lock:
+            state = {**getattr(self, "_state_cache", {}), **self._live_prediction_state}
+            forecasts = build_world_model_forecasts(
+                situation,
+                state.get("predictions") or {},
+                config=config,
+                active_plan=None
+                if execution_snapshot is not None
+                else self._dependencies.plans.get_active(self._scenario_id),
+                previous_tracking_by_target=getattr(self, "_world_model_previous_tracking", {}),
+                execution_snapshot=execution_snapshot,
+                accepted_predictions=state.get("accepted_predictions") or {},
+            )
+            self._live_prediction_state["world_model_forecasts"] = forecasts
+            return forecasts
 
     def _drain_live_prediction_events(self) -> None:
         """Move live prediction triggers into the next graph input mailbox."""
@@ -689,11 +722,12 @@ class CarrierRuntime:
     def tick(self, *, epoch: PlanningEpoch | None = None) -> dict[str, Any]:
         """Advance the clock and run one graph cycle over pending events.
 
-        A real provider failure is terminal: the carrier clock returns to its
-        pre-cycle value, pending events remain queued for diagnosis, and no
-        later cycle is allowed to run on this runtime instance.
+        Non-UUV provider failures remain terminal. UUV-only failures leave the
+        physical loop live so the caller can retry the same planning trigger
+        at its simulation-time deadline.
         """
-        self._raise_if_llm_failed()
+        if not self._uuv_only_mode():
+            self._raise_if_llm_failed()
         self._cycle_running = True
         try:
             with self._lock:
@@ -706,9 +740,11 @@ class CarrierRuntime:
                     self._llm_failure = exc
                     self._llm_paused = True
                     self._llm_pause_reason = str(exc)
-                    self._llm_reconnectable = False
+                    self._llm_reconnectable = self._uuv_only_mode()
                     self._queue_llm_degraded(previous_time_s, str(exc))
                     raise
+                self._llm_failure = None
+                self._llm_reconnectable = False
                 self._llm_paused = False
                 self._llm_pause_reason = None
                 return result
@@ -717,11 +753,14 @@ class CarrierRuntime:
 
     def resume(self, *, epoch: PlanningEpoch | None = None) -> dict[str, Any]:
         """Retry one pending cycle without advancing the carrier clock."""
-        self._raise_if_llm_failed()
+        if not self._uuv_only_mode():
+            self._raise_if_llm_failed()
         self._cycle_running = True
         try:
             with self._lock:
                 result = self._run_cycle(epoch=epoch)
+                self._llm_failure = None
+                self._llm_reconnectable = False
                 self._llm_paused = False
                 self._llm_pause_reason = None
                 return result
@@ -729,7 +768,7 @@ class CarrierRuntime:
             self._llm_failure = exc
             self._llm_paused = True
             self._llm_pause_reason = str(exc)
-            self._llm_reconnectable = False
+            self._llm_reconnectable = self._uuv_only_mode()
             self._queue_llm_degraded(self._dependencies.clock.sim_time_s, str(exc))
             raise
         finally:
@@ -739,6 +778,9 @@ class CarrierRuntime:
         failure = self._llm_failure
         if failure is not None:
             raise failure
+
+    def _uuv_only_mode(self) -> bool:
+        return bool(getattr(self._dependencies, "uuv_only", False))
 
     def _queue_llm_degraded(self, sim_time_s: int, reason: str) -> None:
         """Expose the terminal provider failure without inventing a new plan."""
@@ -757,7 +799,7 @@ class CarrierRuntime:
             payload={
                 "reason": reason,
                 "active_plan_preserved": True,
-                "execution_halted": True,
+                "execution_halted": not self._uuv_only_mode(),
             },
         )
 
@@ -936,6 +978,20 @@ class CarrierRuntime:
         # graph lock while a provider call is in flight.
         self._baseline_executable_mission_plan = plan
 
+    def prepare_llm_retry(self) -> None:
+        """Release a recoverable provider failure before its bounded retry."""
+        with self._lock:
+            if self._llm_reconnectable:
+                self._llm_failure = None
+
+    def mark_llm_recovered(self) -> None:
+        """Clear the runtime failure latch after a successful provider cycle."""
+        with self._lock:
+            self._llm_failure = None
+            self._llm_paused = False
+            self._llm_pause_reason = None
+            self._llm_reconnectable = False
+
     @property
     def execution_coordinator(self) -> object | None:
         """Expose the single authoritative execution coordinator to adapters."""
@@ -1044,6 +1100,9 @@ class CarrierRuntime:
             self._validate_execution_context(execution_revision, frame_id)
             execution_snapshot = self.current_execution_snapshot()
             if execution_snapshot is not None:
+                situation = self._dependencies.situation_provider(
+                    live_situation_ref(self._scenario_id)
+                )
                 resolver = self.execution_evidence_resolver(frame_id=frame_id)
                 payload = answer_execution_question(
                     execution_snapshot,
@@ -1051,6 +1110,7 @@ class CarrierRuntime:
                     evidence_ids=evidence_ids,
                     resolver=resolver,
                     frame_id=frame_id,
+                    situation=situation,
                 )
                 answer = QuestionAnswer.model_validate(payload)
                 self._persist_question_run(
@@ -1219,6 +1279,7 @@ class CarrierRuntime:
                 evidence_ids=evidence_ids,
                 resolver=resolver,
                 frame_id=frame_id,
+                situation=situation,
             )
             answer = QuestionAnswer.model_validate(payload)
         else:

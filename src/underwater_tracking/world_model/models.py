@@ -56,6 +56,24 @@ class EventType(StrEnum):
 class DataStatus(StrEnum):
     READY = "ready"
     DEGRADED = "degraded"
+    EXPIRED = "expired"
+    UNAVAILABLE = "unavailable"
+
+
+class ForecastProvenance(FrozenStrictModel):
+    """Identity of the public evidence, separate from generation/frame time."""
+    source_track_revision: int | None = Field(default=None, ge=1)
+    prediction_revision: int | None = Field(default=None, ge=1)
+    last_observed_at_s: NonNegativeFloat | None = None
+    generated_at_s: NonNegativeFloat | None = None
+    valid_until_s: NonNegativeFloat | None = None
+    source_prediction_id: str | None = None
+    source_plan_revision: int | None = Field(default=None, ge=1)
+    owner_group_id: str | None = None
+    region_id: str | None = None
+    region_geometry_revision: int | None = Field(default=None, ge=1)
+    source_group_id: str | None = None
+    control_authority: Literal[False] = False
 
 
 class HorizonSpec(FrozenStrictModel):
@@ -152,6 +170,7 @@ class TrajectoryForecastInput(FrozenStrictModel):
     corridor_radius_m: tuple[NonNegativeFloat, ...] = Field(min_length=1)
     fallback_used: bool = False
     fallback_reason: str | None = None
+    prediction_regime: Literal["imm", "bspline", "short_history", "boundary_recovery"] = "bspline"
 
     @model_validator(mode="after")
     def arrays_are_aligned_and_time_is_increasing(self) -> TrajectoryForecastInput:
@@ -175,6 +194,7 @@ class UuvForecastInput(FrozenStrictModel):
     healthy: bool = True
     communication_ok: bool = True
     state_age_s: NonNegativeFloat = 0.0
+    state_time_s: NonNegativeFloat | None = None
     planned_times_s: tuple[FiniteFloat, ...] = ()
     planned_points_xy: tuple[PointXY, ...] = ()
 
@@ -208,7 +228,7 @@ class TrackingContextInput(FrozenStrictModel):
         return dict(sorted(value.items()))
 
 
-class RuleWorldModelInput(FrozenStrictModel):
+class RuleWorldModelInput(ForecastProvenance):
     scenario_id: str = Field(min_length=1)
     target_id: str = Field(min_length=1)
     as_of_s: NonNegativeFloat
@@ -220,6 +240,9 @@ class RuleWorldModelInput(FrozenStrictModel):
     source_observation_ids: tuple[str, ...] = ()
     source_observability_event_ids: tuple[str, ...] = ()
     source_plan_revision: int | None = Field(default=None, ge=1)
+    source_status: Literal["current", "degraded", "expired", "unavailable"] = "unavailable"
+    source_reason_codes: tuple[str, ...] = ()
+    task_region_bounds_xy: MapBoundsXY | None = None
 
     @model_validator(mode="after")
     def operational_inputs_are_consistent(self) -> RuleWorldModelInput:
@@ -242,6 +265,9 @@ EvidenceSource = Literal[
     "uuv_projection",
     "map_bounds",
     "observability",
+    "short_history",
+    "boundary_recovery",
+    "task_region",
 ]
 
 
@@ -254,7 +280,7 @@ class RuleEvidence(FrozenStrictModel):
     description: str = Field(min_length=1)
 
 
-class PredictedEvent(FrozenStrictModel):
+class PredictedEvent(ForecastProvenance):
     event_id: str = Field(min_length=1)
     event_type: EventType
     target_id: str = Field(min_length=1)
@@ -277,7 +303,7 @@ class HorizonCoverage(FrozenStrictModel):
     covered: bool
 
 
-class WorldModelForecast(FrozenStrictModel):
+class WorldModelForecast(ForecastProvenance):
     schema_version: str = "world-model-event-forecast-v1"
     model_kind: Literal["rule_demo"] = "rule_demo"
     model_version: str = "rule-event-v1"

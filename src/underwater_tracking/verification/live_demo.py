@@ -362,15 +362,16 @@ def validate_uuv_only_frame(
             ):
                 violations.append("execution_replacement_pair_mismatch")
             continue
-        exiting_groups = [
-            group for group in region_groups if group.get("lifecycle") == "exiting"
-        ]
+        slot_group_ids = {
+            group.get("group_instance_id") for group in region_groups
+        }
         incoming_groups = [
-            group for group in region_groups if group.get("lifecycle") != "exiting"
+            group
+            for group in region_groups
+            if group.get("source_group_instance_id") in slot_group_ids
         ]
         if (
-            len(exiting_groups) != 1
-            or len(incoming_groups) != 1
+            len(incoming_groups) != 1
             or incoming_groups[0].get("lifecycle") == "disappeared"
         ):
             violations.append("execution_replacement_pair_mismatch")
@@ -382,6 +383,11 @@ def validate_uuv_only_frame(
         violations.append("execution_task_group_region_set_mismatch")
     if tracking_mode == "regional":
         linked_group_ids = set(region_task_group_ids)
+        replacement_source_ids = {
+            group.get("source_group_instance_id")
+            for group in groups
+            if isinstance(group.get("source_group_instance_id"), str)
+        }
         unlinked_groups = tuple(
             group
             for group in groups
@@ -389,6 +395,8 @@ def validate_uuv_only_frame(
         )
         if any(
             group.get("lifecycle") not in {"exiting", "disappeared"}
+            and group.get("group_instance_id") not in replacement_source_ids
+            and group.get("source_group_instance_id") not in linked_group_ids
             for group in unlinked_groups
         ):
             violations.append("execution_region_task_group_set_mismatch")
@@ -451,7 +459,10 @@ def validate_uuv_only_frame(
         uuv = uuv_by_id.get(member)
         if uuv is None:
             continue
-        if uuv.get("physically_exposed") is not True:
+        if (
+            uuv.get("physically_exposed") is not True
+            and lifecycle_by_member.get(member) not in {"exiting", "disappeared"}
+        ):
             violations.append("execution_member_physical_exposure_invalid")
         sensor_mode = uuv.get("sensor_mode")
         if sensor_mode not in {"active", "passive"}:
@@ -480,21 +491,21 @@ def validate_uuv_only_frame(
         if isinstance(raw_tracking_control, Mapping)
         else None
     )
-    lookup_region_id = current_region_id
+    lookup_group_id = next(
+        (
+            region.get("task_group_id")
+            for region in regions
+            if region.get("region_id") == current_region_id
+        ),
+        None,
+    )
     if tracking_mode == "dedicated" and isinstance(owner_id, str):
-        lookup_region_id = next(
-            (
-                group.get("region_id")
-                for group in groups
-                if group.get("group_instance_id") == owner_id
-            ),
-            current_region_id,
-        )
+        lookup_group_id = owner_id
     current_group = next(
         (
             group
             for group in groups
-            if group.get("region_id") == lookup_region_id
+            if group.get("group_instance_id") == lookup_group_id
             and group.get("target_id") == target_id
         ),
         None,

@@ -15,6 +15,9 @@ JSON-serializable (tuples, dicts, pydantic models).
 
 from __future__ import annotations
 
+from itertools import groupby
+from math import isfinite
+
 import numpy as np
 
 from underwater_tracking.domain.models import (
@@ -70,30 +73,56 @@ def ingest_observations(state: GroupState) -> dict[str, object]:
     Observations whose ``target_id`` or ``scenario_id`` does not match the
     group are ignored, so a misrouted observation can never move a belief.
     """
-    batch = tuple(
-        observation
-        for observation in state.new_observations
-        if observation.target_id == state.target_id
-        and observation.scenario_id == state.scenario_id
-    )
-    return {"new_observations": (), "last_observations": batch}
+    seen = set(state.processed_observation_ids)
+    batch: list[BearingObservation] = []
+    rejected: set[str] = set()
+    state_time = state.belief.sim_time_s if state.belief is not None else 0
+    for observation in sorted(
+        state.new_observations, key=lambda item: (item.sim_time_s, item.observation_id)
+    ):
+        if observation.target_id != state.target_id or observation.scenario_id != state.scenario_id:
+            continue
+        if observation.observation_id in seen:
+            rejected.add("duplicate_observation")
+        elif observation.sim_time_s < state_time:
+            rejected.add("out_of_sequence_observation")
+        elif state.cycle_sim_time_s is not None and observation.sim_time_s > state.cycle_sim_time_s:
+            rejected.add("future_observation")
+        elif (
+            observation.is_false_alarm
+            or observation.detection_confidence <= 0
+            or not isfinite(observation.azimuth_rad)
+            or not isfinite(observation.variance_rad2)
+            or (
+                observation.observer_position_xy is not None
+                and not all(isfinite(value) for value in observation.observer_position_xy)
+            )
+        ):
+            rejected.add("invalid_observation")
+        else:
+            batch.append(observation)
+            seen.add(observation.observation_id)
+    return {
+        "new_observations": (),
+        "last_observations": tuple(batch),
+        "observation_rejection_reasons": tuple(sorted(rejected)),
+    }
 
 
 def ensure_initialized(state: GroupState) -> dict[str, object]:
     """Initialize the filter on the first cycle; no-op afterwards.
 
     The success path triangulates the current observation batch against the
-    coarse prior; any failure (no observations, no member positions,
-    insufficient geometry) falls back to an inflated-prior belief. The filter
-    is born at ``sim_time_s == 0`` (not at the observation time) so the first
-    update cycle advances with ``dt > 0``: a ``dt == 0`` predict collapses the
-    turn-rate variance to exactly zero, making the covariance singular for
-    the reviewed UIF's next update.
+    coarse prior using simultaneous bearings only. A successful initialization
+    consumes those bearings exactly once at their observation time. Otherwise
+    the diffuse prior starts at zero. Zero-duration prediction is never run.
     """
     if state.filter_snapshot is not None:
         return {}
+    first_time = min((obs.sim_time_s for obs in state.last_observations), default=0)
     used, origins, bearings, variances = _matched_observations(
-        state.last_observations, state.member_positions
+        tuple(obs for obs in state.last_observations if obs.sim_time_s == first_time),
+        state.member_positions,
     )
     mean = np.asarray([state.coarse_prior[0], state.coarse_prior[1], 0.0, 0.0, 0.0], dtype=float)
     covariance = _INFLATED_PRIOR_COVARIANCE.copy()
@@ -117,8 +146,21 @@ def ensure_initialized(state: GroupState) -> dict[str, object]:
             covariance[4, 4] = _TURN_VARIANCE
             source_ids = tuple(observation.observation_id for observation in used)
     estimator = build_default_imm(mean, covariance)
-    belief = _belief_from_estimator(estimator, state, 0, source_ids)
-    return {"filter_snapshot": _capture_estimator(estimator), "belief": belief}
+    belief = _belief_from_estimator(estimator, state, first_time if source_ids else 0, source_ids)
+    if source_ids:
+        belief = belief.model_copy(
+            update={
+                "track_revision": 1,
+                "last_observed_at_s": first_time,
+                "valid_until_s": first_time + state.observation_validity_s,
+            }
+        )
+    return {
+        "filter_snapshot": _capture_estimator(estimator),
+        "belief": belief,
+        "processed_observation_ids": source_ids,
+        "bootstrap_observation_ids": source_ids,
+    }
 
 
 def predict_and_update(state: GroupState) -> dict[str, object]:
@@ -132,21 +174,15 @@ def predict_and_update(state: GroupState) -> dict[str, object]:
     actually updated the filter; predict-only cycles leave it untouched so
     quality can age the track.
 
-    Known limitation (UIF fragility, not this node): the reviewed UIF's
-    sequential update can lose positive definiteness when the covariance has
-    collapsed to the process-noise floor, which surfaces as a cholesky
-    ``LinAlgError`` on a subsequent update at ``dt == 0``. The engine must
-    therefore advance simulation time between update cycles (every
-    observation batch carries a newer timestamp), which keeps ``dt > 0``.
+    Same-time observations are batched, triangulation inputs are consumed
+    once, and a zero-duration prediction never injects artificial process
+    noise. This does not claim to solve every numerical limitation of UIF.
     """
     snapshot = state.filter_snapshot
     belief = state.belief
     if snapshot is None or belief is None:
         raise RuntimeError("predict_and_update called before initialization")
     estimator = _restore_estimator(snapshot)
-    used, origins, bearings, variances = _matched_observations(
-        state.last_observations, state.member_positions
-    )
     observation_time_s = max(
         (observation.sim_time_s for observation in state.last_observations),
         default=belief.sim_time_s,
@@ -156,24 +192,71 @@ def predict_and_update(state: GroupState) -> dict[str, object]:
         observation_time_s,
         state.cycle_sim_time_s if state.cycle_sim_time_s is not None else belief.sim_time_s,
     )
-    estimator.predict(float(max(0, now_s - belief.sim_time_s)))
+    cursor = belief.sim_time_s
     nis_values: list[float] = []
-    if len(used) > 0:
-        # The cv model's per-measurement NIS drives the quality detection rate.
-        nis_values = list(estimator.update(origins, bearings, variances)[0])
-    belief = _belief_from_estimator(
+    accepted: list[BearingObservation] = []
+    rejected = set(state.observation_rejection_reasons)
+    processed = list(state.processed_observation_ids)
+    pending = tuple(
+        obs for obs in state.last_observations if obs.observation_id not in set(processed)
+    )
+    for observed_s, batch in groupby(
+        sorted(pending, key=lambda item: item.sim_time_s), key=lambda item: item.sim_time_s
+    ):
+        used, origins, bearings, variances = _matched_observations(
+            tuple(batch), state.member_positions
+        )
+        if not used:
+            continue
+        if observed_s > cursor:
+            estimator.predict(float(observed_s - cursor))
+            cursor = observed_s
+        per_model = estimator.update(origins, bearings, variances)
+        nis_values.extend(per_model[0])
+        accepted.extend(
+            obs
+            for index, obs in enumerate(used)
+            if any(isfinite(values[index]) and values[index] <= _NIS_GATE for values in per_model)
+        )
+        if any(
+            not any(isfinite(values[index]) and values[index] <= _NIS_GATE for values in per_model)
+            for index in range(len(used))
+        ):
+            rejected.add("innovation_gate_rejected")
+        processed.extend(obs.observation_id for obs in used)
+    if now_s > cursor:
+        estimator.predict(float(now_s - cursor))
+    current_ids = (*state.bootstrap_observation_ids, *(obs.observation_id for obs in accepted))
+    source_ids = tuple(dict.fromkeys((*belief.source_observation_ids, *current_ids)))[-256:]
+    last_observed = max((obs.sim_time_s for obs in accepted), default=belief.last_observed_at_s)
+    updated = _belief_from_estimator(
         estimator,
         state,
         now_s,
-        tuple(observation.observation_id for observation in used),
+        source_ids,
+    )
+    updated = updated.model_copy(
+        update={
+            "track_revision": belief.track_revision
+            + bool(accepted and not state.bootstrap_observation_ids),
+            "last_observed_at_s": last_observed,
+            "valid_until_s": last_observed + state.observation_validity_s
+            if last_observed is not None
+            else None,
+            "accepted_observation_ids_this_cycle": current_ids,
+            "reason_codes": tuple(sorted(rejected))
+            or (() if current_ids else ("no_new_observations",)),
+        }
     )
     result: dict[str, object] = {
         "filter_snapshot": _capture_estimator(estimator),
-        "belief": belief,
+        "belief": updated,
         "last_nis_values": tuple(nis_values),
+        "processed_observation_ids": tuple(dict.fromkeys(processed))[-4096:],
+        "bootstrap_observation_ids": (),
     }
-    if len(used) > 0:
-        result["last_accepted_sim_time_s"] = now_s
+    if current_ids:
+        result["last_accepted_sim_time_s"] = last_observed
     return result
 
 
@@ -392,10 +475,10 @@ def _matched_observations(
     used = [
         observation
         for observation in sorted(batch, key=lambda item: (item.uuv_id, item.observation_id))
-        if observation.uuv_id in positions
+        if observation.uuv_id in positions or observation.observer_position_xy is not None
     ]
     origins = np.asarray(
-        [[positions[observation.uuv_id][0], positions[observation.uuv_id][1]] for observation in used],
+        [observation.observer_position_xy or positions[observation.uuv_id] for observation in used],
         dtype=float,
     )
     bearings = np.asarray([observation.azimuth_rad for observation in used], dtype=float)

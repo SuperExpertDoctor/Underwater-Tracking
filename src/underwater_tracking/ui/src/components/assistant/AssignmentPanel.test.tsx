@@ -72,6 +72,13 @@ const plan = {
         hard_guard_reasons: [],
         expert_feedback_ids: ["feedback-1"],
       },
+      scan_telemetry: {
+        route_progress: 1,
+        active_coverage_ratio: 0.35,
+        source_backed_ping_count: 2,
+        scan_round: 1,
+        scan_completed: false,
+      },
     },
   ],
 };
@@ -109,7 +116,9 @@ describe("AssignmentPanel", () => {
       screen.getByRole("img", { name: "T1 区域接力知识图谱" }),
     ).toBeInTheDocument();
     expect(screen.getByText("启发式 UUV 协同")).toBeInTheDocument();
-    expect(screen.getByText("跟踪覆盖 100% · 质量 86%")).toBeInTheDocument();
+    expect(screen.getByText("路线 100% · 主动覆盖 35%")).toBeInTheDocument();
+    expect(screen.getByText("source-backed ping 2 · 质量 86%")).toBeInTheDocument();
+    expect(screen.getByText("路线完成 · 扫描未完成")).toBeInTheDocument();
     expect(screen.queryByText("专家反馈 1 条")).not.toBeInTheDocument();
     expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
     expect(

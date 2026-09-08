@@ -1004,3 +1004,233 @@
   background: #202526;
   border-color: #384446;
 }
+
+/* Per-target evidence board: this section stays outside the collapsible
+ * panels so owner, lifecycle and freshness are visible on every frame. */
+.target-status-board {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 9px;
+}
+.target-status-board-heading {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2px 8px;
+  align-items: end;
+  padding: 7px 9px;
+  background: var(--panel-raised);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.target-status-board-heading .eyebrow {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+.target-status-board-heading strong {
+  font-size: 12px;
+}
+.target-status-board-heading small {
+  color: var(--muted);
+  font: 9px "IBM Plex Mono", monospace;
+}
+.target-status-card {
+  display: grid;
+  gap: 7px;
+  padding: 9px;
+  background: var(--panel-raised);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--line-bright);
+  border-radius: 6px;
+}
+.target-status-card.estimate-live { border-left-color: var(--green); }
+.target-status-card.estimate-stale { border-left-color: var(--amber); }
+.target-status-card.estimate-expired,
+.target-status-card.estimate-unavailable { border-left-color: var(--red); }
+.target-status-card.estimate-unknown { border-left-color: var(--faint); }
+.target-status-card-heading,
+.target-status-region-heading,
+.target-status-section-heading,
+.target-status-facts,
+.target-status-frame-facts {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 7px;
+  min-width: 0;
+}
+.target-status-card-heading > div,
+.target-status-region-heading strong,
+.target-status-group-heading strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.target-status-card-heading > div { display: grid; gap: 2px; }
+.target-status-card-heading strong {
+  color: var(--ink);
+  font: 700 13px "IBM Plex Mono", monospace;
+}
+.target-status-badge {
+  flex: 0 0 auto;
+  padding: 3px 5px;
+  border: 1px solid currentColor;
+  border-radius: 3px;
+  font: 700 8px "IBM Plex Mono", monospace;
+  white-space: nowrap;
+}
+.target-status-badge.status-live { color: var(--green); }
+.target-status-badge.status-stale { color: var(--amber); }
+.target-status-badge.status-expired,
+.target-status-badge.status-unavailable { color: var(--red); }
+.target-status-badge.status-unknown { color: var(--muted); }
+.target-status-frame-facts {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  color: var(--faint);
+  font: 9px "IBM Plex Mono", monospace;
+}
+.target-status-freshness {
+  display: grid;
+  gap: 3px;
+  padding: 6px 7px;
+  color: var(--muted);
+  background: var(--bg-deep);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-size: 9px;
+  line-height: 1.45;
+}
+.target-status-freshness strong { color: var(--ink); font-size: 10px; }
+.target-status-freshness.expired {
+  color: #ffd1d3;
+  background: rgba(112, 34, 43, 0.34);
+  border-color: rgba(216, 103, 110, 0.75);
+}
+.target-status-freshness.expired strong { color: #ffafb4; }
+.target-status-freshness small { color: inherit; }
+.target-status-section {
+  display: grid;
+  gap: 5px;
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+}
+.target-status-section-heading {
+  color: var(--ink);
+  font-size: 10px;
+  font-weight: 700;
+}
+.target-status-section-heading small {
+  color: var(--faint);
+  font: 8px "IBM Plex Mono", monospace;
+  font-weight: 400;
+}
+.target-status-group,
+.target-status-region,
+.target-status-handoff,
+.target-status-replacements,
+.target-status-dedicated {
+  display: grid;
+  gap: 4px;
+  padding: 6px 7px;
+  background: var(--bg-deep);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+.target-status-group.lifecycle-exiting {
+  border-style: dashed;
+  opacity: 0.82;
+}
+.target-status-group.lifecycle-disappeared {
+  opacity: 0.52;
+}
+.target-status-group-heading,
+.target-status-region-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+}
+.target-status-group-heading strong,
+.target-status-region-heading strong {
+  color: var(--ink);
+  font: 600 9px "IBM Plex Mono", monospace;
+}
+.target-status-group-heading span,
+.target-status-region-heading span {
+  flex: 0 0 auto;
+  color: var(--cyan-deep);
+  font-size: 9px;
+}
+.target-status-facts {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.35;
+}
+.target-status-facts b {
+  margin-left: 2px;
+  color: var(--ink);
+  font: 600 9px "IBM Plex Mono", monospace;
+}
+.target-status-members,
+.target-status-replacement {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.target-status-members span {
+  padding: 2px 4px;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  font: 8px "IBM Plex Mono", monospace;
+}
+.target-status-evidence,
+.target-status-reason,
+.target-status-blocker,
+.target-status-unavailable {
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.target-status-blocker { color: #ffb0b5; }
+.target-status-handoff,
+.target-status-dedicated,
+.target-status-replacements { border-left: 2px solid var(--amber); }
+.target-status-replacement {
+  justify-content: space-between;
+  color: var(--muted);
+  font-size: 8px;
+  line-height: 1.35;
+}
+.target-status-replacement > span { overflow-wrap: anywhere; }
+.replacement-flow { color: var(--ink); }
+.replacement-flow b { color: var(--amber); font: 700 8px "IBM Plex Mono", monospace; }
+.target-status-blockers {
+  display: grid;
+  gap: 3px;
+  padding: 6px 7px;
+  color: #ffc5c8;
+  background: rgba(112, 34, 43, 0.28);
+  border: 1px solid rgba(216, 103, 110, 0.62);
+  border-radius: 4px;
+  font-size: 9px;
+}
+.target-status-blockers strong { color: #ffafb4; }
+.target-status-blockers small { color: #d99da2; font: 8px "IBM Plex Mono", monospace; }
+.assignment-scan-status {
+  padding: 4px 6px;
+  color: var(--muted);
+  background: var(--bg-deep);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  font: 9px "IBM Plex Mono", monospace;
+}
+.assignment-scan-status.scan-route-complete {
+  color: var(--amber);
+  border-color: rgba(219, 161, 75, 0.72);
+}
+.region-timeline-scan-summary {
+  color: var(--faint) !important;
+}
+.region-scan-detail-facts { padding-top: 2px; }

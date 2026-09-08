@@ -19,7 +19,7 @@ const backendCommand = [
   "--steps",
   "0",
   "--seed",
-  "20260904",
+  "42",
   "--host",
   "127.0.0.1",
   "--port",

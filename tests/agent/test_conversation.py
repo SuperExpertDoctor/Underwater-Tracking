@@ -278,6 +278,32 @@ def test_execution_context_is_forwarded_to_memory_prepare_and_accept(tmp_path: P
         rig.close()
 
 
+def test_operational_question_is_answered_when_classifier_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    rig = make_rig(tmp_path, classification("clarification"))
+    rig.context = replace(
+        rig.context,
+        llm=UnavailableStructuredLLM("chat credentials are unavailable"),
+        execution_snapshot=execution_snapshot(frame_id=42),
+        execution_frame_id=42,
+    )
+    try:
+        result = process_conversation_message(
+            message("Why is there no tracking owner?"),
+            rig.context,
+        )
+
+        assert result.classification.classification == "evidence_query"
+        assert result.answer is not None
+        assert result.answer.diagnosis is not None
+        assert result.answer.diagnosis.frame_id == 42
+        assert "No tracking owner" in result.answer.answer
+        assert result.messages[-1].role == "assistant"
+    finally:
+        rig.close()
+
+
 def test_classification_payload_marks_long_term_material_as_non_factual(tmp_path: Path) -> None:
     from underwater_tracking.agent.nodes.conversation import build_classification_payload
 
@@ -295,6 +321,16 @@ def test_classification_payload_marks_long_term_material_as_non_factual(tmp_path
     context = rig.context.__class__(
         **{
             **rig.context.__dict__,
+            "situation": rig.context.situation.model_copy(
+                update={
+                    "region_probability_evidence": {
+                        "R1": {
+                            "probability": 0.7,
+                            "truth_position": (12.0, 15.0),
+                        }
+                    }
+                }
+            ),
             "memory_context": MemoryContext(
                 user_id="operator",
                 long_term_material=(
@@ -317,6 +353,9 @@ def test_classification_payload_marks_long_term_material_as_non_factual(tmp_path
         assert payload["short_term_context"] is None
         assert payload["long_term_material"][0]["memory_id"] == "memory-1"  # type: ignore[index]
         assert payload["long_term_material_is_not_fact"] is True
+        serialized = json.dumps(payload, ensure_ascii=True, sort_keys=True)
+        assert "truth_position" not in serialized
+        assert "ground_truth" not in serialized
     finally:
         rig.close()
 

@@ -9,6 +9,7 @@ import {
   timelineRowsForFrame,
   timelineWindow,
 } from "./regionTimeline";
+import { scanCoveragePercent, scanPingCount, scanRouteProgressPercent } from "../domain/operationalStatus";
 
 interface RegionTimelinePanelProps {
   frame: OperationalFrame | null;
@@ -35,6 +36,10 @@ function AssignmentList({ row }: { row: RegionTimelineView }) {
 }
 
 function RegionDetail({ row }: { row: RegionTimelineView }) {
+  const telemetry = row.scan_telemetry;
+  const routeProgress = scanRouteProgressPercent(telemetry ?? null);
+  const activeCoverage = scanCoveragePercent(telemetry ?? null);
+  const pingCount = scanPingCount(telemetry ?? null);
   return <section className="region-timeline-detail" aria-label="区域详情">
     <div className="region-detail-header"><strong>{row.region_id}</strong><span className={`region-status status-${row.status}`}>{STATUS_LABELS[row.status]}</span></div>
     <div className="region-detail-facts">
@@ -44,6 +49,12 @@ function RegionDetail({ row }: { row: RegionTimelineView }) {
       <span>中心 <b>({row.center.x.toFixed(0)}, {row.center.y.toFixed(0)}) m</b></span>
       <span>优先级 <b>{row.priority.toFixed(2)}</b></span>
       <span>计划 <b>v{row.plan_revision}</b></span>
+    </div>
+    <div className="region-detail-facts region-scan-detail-facts">
+      <span>路线进度 <b>{routeProgress == null ? "不可用" : `${Math.round(routeProgress)}%`}</b></span>
+      <span>主动覆盖 <b>{activeCoverage == null ? "不可用" : `${Math.round(activeCoverage)}%`}</b></span>
+      <span>source-backed ping <b>{pingCount == null ? "不可用" : pingCount}</b></span>
+      <span>扫描状态 <b>{telemetry?.scan_completed == null ? "不可用" : telemetry.scan_completed ? "已完成" : "未完成"}</b></span>
     </div>
     <AssignmentList row={row} />
     {(row.handoff_from || row.handoff_to) && <p className="region-handoff-detail">接力：{row.handoff_from ?? "起始"} → {row.handoff_to ?? "结束"}</p>}

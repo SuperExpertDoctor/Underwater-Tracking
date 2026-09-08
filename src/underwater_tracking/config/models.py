@@ -112,6 +112,7 @@ class TrackingPolicyConfig(StrictModel):
     uuv_passive_detection_radius_m: PositiveFloat = 600.0
     region_entry_probability_threshold: float = Field(0.70, gt=0, le=1)
     region_transition_confirm_cycles: int = Field(2, ge=1)
+    scan_completion_threshold: float = Field(0.80, ge=0, le=1)
     max_uuv_mileage_m: PositiveFloat = 50_000.0
     dedicated_release_remaining_mileage_m: PositiveFloat = 7_000.0
 
@@ -178,6 +179,20 @@ class PredictionHealthConfig(StrictModel):
     def validate_windows(self) -> "PredictionHealthConfig":
         if self.hard_stale_s < self.refresh_interval_s:
             raise ValueError("hard_stale_s must be >= refresh_interval_s")
+        return self
+
+
+class ExecutionRefreshConfig(StrictModel):
+    """Deadline and retry policy for authoritative execution snapshots."""
+
+    validity_s: float = Field(default=450.0, gt=0)
+    margin_s: float = Field(default=120.0, ge=30.0)
+    retry_interval_s: float = Field(default=30.0, ge=30.0)
+
+    @model_validator(mode="after")
+    def validate_windows(self) -> "ExecutionRefreshConfig":
+        if self.validity_s <= self.margin_s:
+            raise ValueError("validity_s must be greater than margin_s")
         return self
 
 
@@ -325,6 +340,9 @@ class AgentConfig(StrictModel):
     )
     trajectory_diff: TrajectoryDiffConfig = Field(
         default_factory=TrajectoryDiffConfig
+    )
+    execution_refresh: ExecutionRefreshConfig = Field(
+        default_factory=ExecutionRefreshConfig
     )
     retention: RuntimeRetentionConfig = Field(default_factory=RuntimeRetentionConfig)
 
@@ -511,6 +529,21 @@ class AppConfig(StrictModel):
     doctrine: DoctrineConfig | None = None
     memory: MemoryConfig | None = None
     world_model: RuleWorldModelConfig | None = None
+
+    @model_validator(mode="after")
+    def execution_refresh_matches_observation_step(self) -> "AppConfig":
+        if self.agent is None:
+            return self
+        refresh = self.agent.execution_refresh
+        if refresh.margin_s < self.timing.observation_step_s:
+            raise ValueError(
+                "execution refresh margin must be at least observation_step_s"
+            )
+        if refresh.retry_interval_s < self.timing.observation_step_s:
+            raise ValueError(
+                "execution refresh retry interval must be at least observation_step_s"
+            )
+        return self
 
     @model_validator(mode="after")
     def platform_core_is_complete(self) -> "AppConfig":

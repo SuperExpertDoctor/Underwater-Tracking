@@ -9,6 +9,9 @@ from typing import cast
 from scipy.integrate import quad  # type: ignore[import-untyped]
 from scipy.special import ndtr  # type: ignore[import-untyped]
 
+from underwater_tracking.domain.models import TargetBelief
+from underwater_tracking.tracking.public_estimate import assess_public_estimate
+
 
 def _rectangle_bounds(
     polygon_xy: Sequence[tuple[float, float]],
@@ -98,12 +101,18 @@ def gaussian_probability_in_axis_aligned_region(
         return None
     conditional_std_y = sqrt(conditional_variance_y)
     marginal_std_x = sqrt(variance_x)
+    lower_z = (min_x - mean_x) / marginal_std_x
+    upper_z = (max_x - mean_x) / marginal_std_x
+    # Integrating in standardized coordinates keeps scipy.quad from missing
+    # a narrow Gaussian when the region itself is far from the origin.
+    integration_lower = max(lower_z, -12.0)
+    integration_upper = min(upper_z, 12.0)
+    if integration_lower >= integration_upper:
+        return 0.0
 
-    def integrand(x_value: float) -> float:
-        standardized_x = (x_value - mean_x) / marginal_std_x
-        marginal_density = exp(-0.5 * standardized_x**2) / (
-            marginal_std_x * sqrt(2.0 * pi)
-        )
+    def integrand(standardized_x: float) -> float:
+        x_value = mean_x + marginal_std_x * standardized_x
+        marginal_density = exp(-0.5 * standardized_x**2) / sqrt(2.0 * pi)
         conditional_mean_y = mean_y + covariance_xy_value / variance_x * (
             x_value - mean_x
         )
@@ -114,8 +123,8 @@ def gaussian_probability_in_axis_aligned_region(
     try:
         probability, _ = quad(
             integrand,
-            min_x,
-            max_x,
+            integration_lower,
+            integration_upper,
             epsabs=1e-10,
             epsrel=1e-10,
             limit=100,
@@ -128,4 +137,36 @@ def gaussian_probability_in_axis_aligned_region(
     return max(0.0, min(1.0, float(probability)))
 
 
-__all__ = ["gaussian_probability_in_axis_aligned_region"]
+def public_region_probability(
+    *, belief: TargetBelief, now_s: float, polygon_xy: Sequence[tuple[float, float]],
+) -> dict[str, object]:
+    """Probability with auditable provenance; unavailable is not zero probability.
+
+    Eligibility describes a new observation-backed cycle. The mission owner
+    remains responsible for counting distinct revisions and changing modes.
+    """
+    health = assess_public_estimate(belief, now_s)
+    result: dict[str, object] = {
+        **health.model_dump(mode="json"), "probability": None, "polygon_xy": [list(point) for point in polygon_xy],
+        "eligible_for_confirmation": False,
+    }
+    if health.status in {"expired", "unavailable"}:
+        return result
+    probability = gaussian_probability_in_axis_aligned_region(
+        mean_xy=(belief.mean[0], belief.mean[1]),
+        covariance_xy=((belief.covariance[0][0], belief.covariance[0][1]),
+                       (belief.covariance[1][0], belief.covariance[1][1])),
+        polygon_xy=polygon_xy,
+    )
+    result["probability"] = probability
+    result["eligible_for_confirmation"] = bool(
+        probability is not None and belief.accepted_observation_ids_this_cycle
+        and belief.sim_time_s == now_s
+    )
+    if probability is None:
+        result["status"] = "unavailable"
+        result["reason_codes"] = [*health.reason_codes, "region_geometry_or_integral_invalid"]
+    return result
+
+
+__all__ = ["gaussian_probability_in_axis_aligned_region", "public_region_probability"]

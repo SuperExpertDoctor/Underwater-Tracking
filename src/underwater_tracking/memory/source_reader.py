@@ -10,6 +10,7 @@ from typing import Any
 from underwater_tracking.domain.event_registry import is_memory_source_event
 from underwater_tracking.domain.models import EventAudience
 from underwater_tracking.domain.memory_models import ShortTermMessage
+from underwater_tracking.domain.public_payload import sanitize_public_payload
 from underwater_tracking.persistence.events import EventRepository, StoredEvent
 from underwater_tracking.persistence.ledger import DecisionLedger
 from underwater_tracking.persistence.memory import (
@@ -21,6 +22,21 @@ from underwater_tracking.persistence.plans import PlanRepository
 
 _DISCOVERY_SCENARIO_ID = "__memory_scope_discovery__"
 _DISCOVERY_SOURCE_PREFIX = "__scope_discovery__:"
+_TRACKING_EPISODE_EVENT_KINDS = {
+    "execution_snapshot_expired": "execution_recovery",
+    "execution_snapshot_rejected": "execution_recovery",
+    "execution_refresh_rejected": "execution_recovery",
+    "execution_refresh_waiting_for_source": "execution_recovery",
+    "execution_snapshot_recovered": "execution_recovery",
+    "passive_track_started": "passive_tracking",
+    "tracking_ownership_transferred": "tracking_handoff",
+    "task_group_disappeared": "tracking_handoff",
+    "uuv_boundary_replacement": "uuv_replacement",
+    "member_replaced": "uuv_replacement",
+    "dedicated_tracking_started": "dedicated_recovery",
+    "dedicated_release_threshold_reached": "dedicated_recovery",
+    "regional_mode_restored": "dedicated_recovery",
+}
 _PUBLIC_EVENT_PAYLOAD_FIELDS = frozenset(
     {
         "absolute_floor_m",
@@ -28,8 +44,10 @@ _PUBLIC_EVENT_PAYLOAD_FIELDS = frozenset(
         "active_scan_uuv_ids",
         "assignment_uuv_ids",
         "assigned_uuv_ids",
+        "attempt_id",
         "capability_active",
         "candidate_id",
+        "candidate_execution_revision",
         "carrier_id",
         "coverage",
         "confidence",
@@ -44,6 +62,8 @@ _PUBLIC_EVENT_PAYLOAD_FIELDS = frozenset(
         "deployment_state",
         "energy_fraction",
         "evidence_ids",
+        "execution_health_reasons",
+        "execution_health_status",
         "gap_s",
         "gap_threshold_s",
         "group_id",
@@ -74,13 +94,18 @@ _PUBLIC_EVENT_PAYLOAD_FIELDS = frozenset(
         "previous",
         "probabilities",
         "quality",
+        "reason_code",
         "reason",
+        "recovered_execution_revision",
+        "recovery_latency_s",
         "region_id",
         "region_assignments",
         "reserve_uuv_ids",
+        "refresh_status",
         "route_status",
         "sensor_mode",
         "source",
+        "source_snapshot_revision",
         "source_observation_ids",
         "speed_mps",
         "status",
@@ -88,12 +113,14 @@ _PUBLIC_EVENT_PAYLOAD_FIELDS = frozenset(
         "successor_region_id",
         "successor_uuv_ids",
         "target_id",
+        "prediction_revision",
         "threshold",
         "tracking_quality",
         "uuv_id",
         "uuv_ids",
         "predecessor_region_id",
         "predecessor_uuv_ids",
+        "expired_execution_revision",
     }
 )
 _PUBLIC_SOURCE_FIELDS = frozenset(
@@ -159,6 +186,7 @@ class MemorySource:
     source_cursor_type: str | None = None
     execution_revision: int | None = None
     frame_id: int | None = None
+    episode_kind: str | None = None
 
 
 class MemorySourceProvenanceError(ValueError):
@@ -511,9 +539,10 @@ def _event_source(event: StoredEvent) -> MemorySource:
     for field_name in sorted(_PUBLIC_EVENT_PAYLOAD_FIELDS):
         if field_name in event.payload:
             payload[field_name] = _bounded_event_value(field_name, event.payload[field_name])
-    memory_eligible = (
-        EventAudience.MEMORY_SOURCE in event.audiences
-        and is_memory_source_event(event.event_type, event.payload)
+    episode_kind = tracking_episode_kind(event.event_type)
+    memory_eligible = EventAudience.MEMORY_SOURCE in event.audiences and (
+        is_memory_source_event(event.event_type, event.payload)
+        or episode_kind is not None
     )
     evidence_text = _bounded_text(payload)
     if summary is not None and memory_eligible and event.event_type != "periodic_situation_summary":
@@ -530,7 +559,14 @@ def _event_source(event: StoredEvent) -> MemorySource:
         source_event_ids=(event.event_id,),
         execution_revision=execution_revision,
         frame_id=frame_id,
+        episode_kind=episode_kind,
     )
+
+
+def tracking_episode_kind(event_type: str) -> str | None:
+    """Return the deterministic episode route for a runtime event."""
+
+    return _TRACKING_EPISODE_EVENT_KINDS.get(event_type)
 
 
 def _stamp_source_context(source: MemorySource, payload: object) -> MemorySource:
@@ -617,6 +653,9 @@ def _bounded_text(value: Mapping[str, Any]) -> str:
 
 def _bounded_value(value: object, depth: int = 0) -> object:
     """Bound nested source evidence while retaining structured decision fields."""
+    if isinstance(value, Mapping):
+        sanitized = sanitize_public_payload(value)
+        value = sanitized if isinstance(sanitized, Mapping) else {}
     if depth >= 4:
         return str(value)[:128]
     if isinstance(value, Mapping):

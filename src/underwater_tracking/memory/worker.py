@@ -651,9 +651,19 @@ class MemoryWorker:
         for user_id, scenario_id in scopes:
             try:
                 runtime_event_cursor: int | None = None
+                tracking_sources: list[dict[str, object]] = []
                 for source in self._source_reader.read_new(user_id, scenario_id):
                     if source.source_type == "runtime_event":
                         runtime_event_cursor = max(runtime_event_cursor or 0, source.cursor)
+                        if source.episode_kind is not None and source.source_event_ids:
+                            tracking_sources.append(
+                                {
+                                    "event_id": source.source_event_ids[0],
+                                    "event_type": source.payload.get("event_type"),
+                                    "sim_time_s": source.payload.get("sim_time_s", 0),
+                                    "payload": source.payload,
+                                }
+                            )
                     if not source.memory_eligible:
                         continue
                     source_id = _source_id(source)
@@ -670,6 +680,12 @@ class MemoryWorker:
                         source.payload,
                     )
                     queued = queued or outcome["status"] == "queued"
+                if tracking_sources:
+                    self._service.ingest_tracking_events(
+                        user_id,
+                        scenario_id,
+                        tracking_sources,
+                    )
                 if runtime_event_cursor is not None:
                     self._repository.advance_source_cursor(
                         user_id,

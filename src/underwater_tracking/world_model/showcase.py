@@ -133,6 +133,9 @@ def _advance_demo_input(
     return inputs.model_copy(
         update={
             "as_of_s": as_of_s,
+            "generated_at_s": as_of_s, "last_observed_at_s": as_of_s,
+            "valid_until_s": as_of_s + 900.0, "source_track_revision": frame_id,
+            "prediction_revision": frame_id,
             "belief": inputs.belief.model_copy(
                 update={"position_xy": position, "velocity_xy_mps": velocity}
             ),
@@ -184,6 +187,8 @@ def build_showcase_frame(
             covariance=covariance,
             model_probabilities=inputs.belief.model_probabilities,
             source_observation_ids=inputs.source_observation_ids,
+            track_revision=inputs.source_track_revision,
+            last_observed_at_s=int(inputs.last_observed_at_s), valid_until_s=int(inputs.valid_until_s),
             fim_min_eigenvalue=0.01,
             fim_condition=2.0,
         ),
@@ -235,6 +240,9 @@ def build_showcase_frame(
         map_bounds_xy=inputs.map_bounds_xy,
     )
     prediction = PredictedTrackRef(
+        source_track_revision=inputs.source_track_revision, prediction_revision=inputs.prediction_revision,
+        last_observed_at_s=inputs.last_observed_at_s, generated_at_s=inputs.generated_at_s,
+        valid_until_s=inputs.valid_until_s,
         prediction_id=inputs.trajectory.prediction_id,
         target_id=inputs.target_id,
         sim_time_s=int(inputs.as_of_s),

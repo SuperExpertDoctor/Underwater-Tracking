@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any, cast
 
-from underwater_tracking.agent.llm import LLMConfigError, StructuredLLM
+from underwater_tracking.agent.llm import LLMError, StructuredLLM
 from underwater_tracking.agent.nodes.directives import (
     DIRECTIVE_OPERATION,
     directive_preview_diff,
@@ -23,8 +23,10 @@ from underwater_tracking.agent.nodes.snapshot import PlanningSnapshot, build_pla
 from underwater_tracking.runtime.execution_evidence import (
     ExecutionEvidenceResolver,
     answer_execution_question,
+    classify_operational_question,
 )
 from underwater_tracking.domain.agent_models import ExpertDirective, TrackingPlan
+from underwater_tracking.domain.public_payload import sanitize_public_mapping
 from underwater_tracking.domain.conversation_models import (
     AssistantMode,
     ConversationAnswer,
@@ -97,7 +99,7 @@ def build_classification_payload(
             for hit in (memory_context.long_term_material[:8] if memory_context else ())
         ]
     )
-    return {
+    return sanitize_public_mapping({
         "conversation_id": message.conversation_id,
         "message_id": message.message_id,
         "text": message.text,
@@ -129,7 +131,7 @@ def build_classification_payload(
             if memory_context is not None
             else MemoryStreamStatus.DEGRADED.value
         ),
-    }
+    })
 
 
 def process_conversation_message(
@@ -150,6 +152,11 @@ def process_conversation_message(
             "conversation plan version mismatch: "
             f"expected {message.expected_plan_version}, current {current_version}"
         )
+    if (
+        context.execution_snapshot is not None
+        and classify_operational_question(message.text) is not None
+    ):
+        return _deterministic_execution_turn(context, message, memory_context)
     try:
         classification = context.llm.invoke_structured(
             CONVERSATION_OPERATION,
@@ -157,7 +164,7 @@ def process_conversation_message(
             ConversationClassification,
             prompt_version=CONVERSATION_PROMPT_VERSION,
         )
-    except LLMConfigError as exc:
+    except LLMError as exc:
         return _degraded_turn(context, message, memory_context, str(exc))
     if (
         classification.expected_plan_version is not None
@@ -312,6 +319,56 @@ def process_conversation_message(
         frame_id=context.execution_frame_id,
         unresolved_evidence=answer.unresolved_evidence if answer is not None else (),
         decision_record=answer.decision_record if answer is not None else None,
+        diagnosis=answer.diagnosis if answer is not None else None,
+    )
+    return _accept_turn(context, message, result)
+
+
+def _deterministic_execution_turn(
+    context: ConversationContext,
+    message: ConversationMessage,
+    memory_context: MemoryContext,
+) -> ConversationTurnResult:
+    """Answer the four operational questions without a classifier call."""
+
+    assert context.execution_snapshot is not None
+    answer = _answer_read_only(
+        message.text,
+        context,
+        None,
+        requested_evidence_ids=message.evidence_ids,
+    )
+    turn_id = f"{message.conversation_id}:turn:{message.message_id}"
+    classification = ConversationClassification(
+        classification="evidence_query",
+        confidence=1.0,
+        evidence_ids=answer.evidence_ids,
+        expected_plan_version=message.expected_plan_version,
+    )
+    expert_message = message.model_copy(update={"turn_id": turn_id})
+    assistant_message = _assistant_message(
+        message,
+        turn_id,
+        answer.answer,
+        classification="evidence_query",
+        evidence_ids=answer.evidence_ids,
+    )
+    result = ConversationTurnResult(
+        conversation_id=message.conversation_id,
+        turn_id=turn_id,
+        user_id=message.user_id,
+        assistant_mode=message.assistant_mode,
+        classification=classification,
+        messages=(expert_message, assistant_message),
+        evidence_ids=answer.evidence_ids,
+        answer=ConversationAnswer.model_validate(answer.model_dump(mode="json")),
+        expected_plan_version=message.expected_plan_version,
+        memory_context=memory_context,
+        execution_revision=context.execution_snapshot.execution_revision,
+        frame_id=context.execution_frame_id,
+        unresolved_evidence=answer.unresolved_evidence,
+        decision_record=answer.decision_record,
+        diagnosis=answer.diagnosis,
     )
     return _accept_turn(context, message, result)
 
@@ -711,6 +768,7 @@ def _answer_read_only(
                 frame_id=context.execution_frame_id,
             ),
             frame_id=context.execution_frame_id,
+            situation=context.situation,
         )
         return QuestionAnswer.model_validate(payload)
     snapshot: PlanningSnapshot = build_planning_snapshot(

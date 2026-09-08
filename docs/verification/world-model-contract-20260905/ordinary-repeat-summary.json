@@ -1,0 +1,77 @@
+{
+  "runs": [
+    {
+      "mode": "ordinary_physics_with_deterministic_llm_stub",
+      "live_external_provider": false,
+      "seed": 42,
+      "physics_step_s": 5,
+      "requested_seconds": 3600,
+      "completed_seconds": 3600,
+      "failure": null,
+      "clean_shutdown": true,
+      "carrier_errors": [],
+      "observation_count": 9,
+      "observation_ids": [
+        "active:uuv_01:target_00:695",
+        "active:uuv_03:target_00:815",
+        "active:uuv_03:target_00:845",
+        "active:uuv_03:target_00:905",
+        "active:uuv_04:target_00:785",
+        "active:uuv_04:target_00:815",
+        "active:uuv_06:target_00:1055",
+        "active:uuv_09:target_00:1085",
+        "active:uuv_09:target_00:1115"
+      ],
+      "max_track_revision": 8,
+      "forecast_status_counts": {
+        "unavailable": 40,
+        "degraded": 27,
+        "expired": 53
+      },
+      "event_type_counts": {
+        "target_abnormal_stop": 22
+      },
+      "first_owner_seen": false,
+      "owner_change_seen": false,
+      "joint_acceptance": "NOT_RUN_EXTERNAL_PROVIDER_AND_OTHER_OWNER_GATES",
+      "trace_sha256": "bcc94b2da43b0109adc468b9493ef5361312196b00a9ff0a30678b7e15f81351"
+    },
+    {
+      "mode": "ordinary_physics_with_deterministic_llm_stub",
+      "live_external_provider": false,
+      "seed": 42,
+      "physics_step_s": 5,
+      "requested_seconds": 3600,
+      "completed_seconds": 3600,
+      "failure": null,
+      "clean_shutdown": true,
+      "carrier_errors": [],
+      "observation_count": 9,
+      "observation_ids": [
+        "active:uuv_01:target_00:695",
+        "active:uuv_03:target_00:815",
+        "active:uuv_03:target_00:845",
+        "active:uuv_03:target_00:905",
+        "active:uuv_04:target_00:785",
+        "active:uuv_04:target_00:815",
+        "active:uuv_06:target_00:1055",
+        "active:uuv_09:target_00:1085",
+        "active:uuv_09:target_00:1115"
+      ],
+      "max_track_revision": 8,
+      "forecast_status_counts": {
+        "unavailable": 40,
+        "degraded": 27,
+        "expired": 53
+      },
+      "event_type_counts": {
+        "target_abnormal_stop": 22
+      },
+      "first_owner_seen": false,
+      "owner_change_seen": false,
+      "joint_acceptance": "NOT_RUN_EXTERNAL_PROVIDER_AND_OTHER_OWNER_GATES",
+      "trace_sha256": "bcc94b2da43b0109adc468b9493ef5361312196b00a9ff0a30678b7e15f81351"
+    }
+  ],
+  "repeat_trace_equal": true
+}

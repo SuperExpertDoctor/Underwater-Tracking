@@ -14,6 +14,7 @@ scenario:
     uuv_passive_detection_radius_m: 600.0
     region_entry_probability_threshold: 0.70
     region_transition_confirm_cycles: 2
+    scan_completion_threshold: 0.80
     max_uuv_mileage_m: 50000.0
     dedicated_release_remaining_mileage_m: 7000.0
   # Flat fields remain for non-UUV-only and legacy readers.

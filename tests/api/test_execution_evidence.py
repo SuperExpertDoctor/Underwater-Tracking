@@ -13,12 +13,18 @@ from underwater_tracking.domain.conversation_models import (
     ConversationMessage,
     ConversationTurnResult,
 )
+from underwater_tracking.domain.conversation_models import OperationalDiagnosis
 from underwater_tracking.domain.memory_models import (
     MemoryContext,
     MemoryStreamEvent,
     MemoryStreamStatus,
 )
 from underwater_tracking.domain.models import SituationSnapshot
+from underwater_tracking.domain.execution_models import TrackingControlState
+from underwater_tracking.runtime.execution_evidence import (
+    answer_execution_question,
+    build_operational_diagnosis,
+)
 from underwater_tracking.agent.nodes.questions import QuestionAnswer
 
 
@@ -369,3 +375,70 @@ def test_memory_degradation_keeps_execution_context() -> None:
     assert response.json()["degraded_reason"] == "LLM unavailable"
     assert response.json()["execution_revision"] == 9
     assert response.json()["frame_id"] == 42
+
+
+def test_operational_diagnosis_uses_current_public_evidence_and_ages() -> None:
+    snapshot = execution_snapshot(frame_id=42)
+    situation = SituationSnapshot(
+        scenario_id="S1",
+        snapshot_revision=snapshot.source_snapshot_revision,
+        sim_time_s=420,
+        uuvs=(),
+        group_reports=(),
+        pending_events=(),
+        region_probability_evidence={
+            "target_00:task:01": {
+                "probability": 0.82,
+                "entry_confirmations": 1,
+                "required_confirmations": 2,
+                "coverage_ratio": 0.4,
+                "source_backed_ping_count": 2,
+            }
+        },
+    )
+
+    diagnosis = build_operational_diagnosis(
+        snapshot,
+        situation=situation,
+        frame_id=42,
+    )
+
+    assert isinstance(diagnosis, OperationalDiagnosis)
+    assert diagnosis.frame_id == 42
+    assert diagnosis.sim_time_s == 420
+    assert diagnosis.execution_revision == 9
+    assert diagnosis.planning_data_age_s == 300
+    assert diagnosis.target_estimate_age_s == 320
+    assert diagnosis.region_entry_progress[0].confirmations == 1
+    assert diagnosis.region_entry_progress[0].required_confirmations == 2
+    assert diagnosis.region_entry_progress[0].coverage_ratio == 0.4
+    assert diagnosis.region_entry_progress[0].source_backed_ping_count == 2
+    assert diagnosis.region_entry_progress[1].blocked_reason is not None
+
+
+def test_execution_question_templates_bind_frame_revision_and_missing_owner() -> None:
+    snapshot = execution_snapshot(
+        frame_id=42,
+        tracking_control=TrackingControlState(mode="regional"),
+    )
+    situation = SituationSnapshot(
+        scenario_id="S1",
+        snapshot_revision=snapshot.source_snapshot_revision,
+        sim_time_s=420,
+        uuvs=(),
+        group_reports=(),
+        pending_events=(),
+    )
+
+    payload = answer_execution_question(
+        snapshot,
+        "Why is there no tracking owner?",
+        situation=situation,
+        frame_id=42,
+    )
+
+    assert "frame_id=42" in payload["answer"]
+    assert "execution_revision=9" in payload["answer"]
+    assert "No tracking owner" in payload["answer"]
+    assert payload["diagnosis"]["tracking_owner_group_id"] is None
+    assert "truth" not in str(payload).lower()

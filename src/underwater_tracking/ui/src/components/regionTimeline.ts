@@ -6,6 +6,7 @@ import {
   groupInstanceId,
   groupsByRegionSlot,
 } from "../state/executionSelectors";
+import { entryEvidenceForRegion, scanTelemetryForRegion } from "../domain/operationalStatus";
 
 export interface TimelineWindow {
   start: number;
@@ -85,7 +86,7 @@ function executionTimelineRows(frame: OperationalFrame): RegionTimelineView[] {
         status: executionStatus(region.status),
         coverage_mode: "required" as const,
         priority: 1,
-        occupancy_likelihood: 1,
+        occupancy_likelihood: entryEvidenceForRegion(execution, region.region_id)?.probability ?? null,
         uuv_assignments: assignments,
         communication_links: [],
         handoff_from: region.predecessor_region_id,
@@ -99,6 +100,7 @@ function executionTimelineRows(frame: OperationalFrame): RegionTimelineView[] {
         task_group_id: displayGroup
           ? groupInstanceId(displayGroup)
           : null,
+        scan_telemetry: scanTelemetryForRegion(region),
       };
     });
 }

@@ -16,6 +16,7 @@ from underwater_tracking.domain.memory_models import (
     MemoryVersion,
     ShortTermMessage,
 )
+from underwater_tracking.domain.models import EventLevel, RuntimeEvent
 from underwater_tracking.memory.service import MemoryService
 from underwater_tracking.persistence.memory import LongTermMemoryRepository, ShortTermContextRepository
 
@@ -28,6 +29,165 @@ class RecordingRetriever:
     def retrieve(self, **kwargs):
         self.calls.append(kwargs)
         return self.result
+
+
+def _episode_event(
+    event_id: str,
+    event_type: str,
+    *,
+    sim_time_s: int,
+    execution_revision: int = 4,
+    entity_id: str | None = None,
+    **payload: object,
+) -> RuntimeEvent:
+    return RuntimeEvent.model_construct(
+        event_id=event_id,
+        scenario_id="scenario-1",
+        sim_time_s=sim_time_s,
+        event_type=event_type,
+        entity_id=entity_id,
+        level=EventLevel.INFORMATIONAL,
+        audiences=frozenset(),
+        payload={"execution_revision": execution_revision, **payload},
+    )
+
+
+def test_tracking_episode_rejections_merge_and_recovery_closes_one_episode(
+    tmp_path: Path,
+) -> None:
+    short_term = ShortTermContextRepository(tmp_path / "memory.db")
+    long_term = LongTermMemoryRepository(tmp_path / "memory.db")
+    service = MemoryService(short_term, long_term, RecordingRetriever(None))
+    events = (
+        _episode_event("expired", "execution_snapshot_expired", sim_time_s=300),
+        _episode_event("rejected", "execution_snapshot_rejected", sim_time_s=305),
+        _episode_event("rejected-again", "execution_snapshot_rejected", sim_time_s=310),
+        _episode_event(
+            "recovered",
+            "execution_snapshot_recovered",
+            sim_time_s=330,
+            recovered_execution_revision=5,
+        ),
+    )
+
+    episodes = service.ingest_tracking_events("operator", "scenario-1", events)
+
+    recovery = [episode for episode in episodes if episode.kind == "execution_recovery"]
+    assert len(recovery) == 1
+    assert recovery[0].status.value == "closed"
+    assert recovery[0].source_event_ids == (
+        "expired",
+        "rejected",
+        "rejected-again",
+        "recovered",
+    )
+    assert recovery[0].episode_key == ("scenario-1", "execution_recovery", "execution", 4)
+    assert service.tracking_episodes("operator", "scenario-1")[0].status.value == "closed"
+
+
+def test_refresh_waiting_events_merge_into_recovery_episode(
+    tmp_path: Path,
+) -> None:
+    short_term = ShortTermContextRepository(tmp_path / "memory.db")
+    long_term = LongTermMemoryRepository(tmp_path / "memory.db")
+    service = MemoryService(short_term, long_term, RecordingRetriever(None))
+    events = (
+        _episode_event(
+            "waiting-1",
+            "execution_refresh_waiting_for_source",
+            sim_time_s=1_200,
+            execution_revision=35,
+            candidate_execution_revision=36,
+            reason_code="public_source_expired",
+        ),
+        _episode_event(
+            "waiting-2",
+            "execution_refresh_waiting_for_source",
+            sim_time_s=1_230,
+            execution_revision=35,
+            candidate_execution_revision=36,
+            reason_code="public_source_expired",
+        ),
+        _episode_event(
+            "recovered",
+            "execution_snapshot_recovered",
+            sim_time_s=1_260,
+            execution_revision=36,
+            expired_execution_revision=35,
+            recovered_execution_revision=36,
+        ),
+    )
+
+    episodes = service.ingest_tracking_events("operator", "scenario-1", events)
+
+    recovery = [episode for episode in episodes if episode.kind == "execution_recovery"]
+    assert len(recovery) == 1
+    assert recovery[0].status.value == "closed"
+    assert recovery[0].source_event_ids == ("waiting-1", "waiting-2", "recovered")
+    assert recovery[0].episode_key == (
+        "scenario-1",
+        "execution_recovery",
+        "execution",
+        35,
+    )
+
+
+def test_tracking_episode_ingestion_rejects_events_from_another_scenario(
+    tmp_path: Path,
+) -> None:
+    short_term = ShortTermContextRepository(tmp_path / "memory.db")
+    long_term = LongTermMemoryRepository(tmp_path / "memory.db")
+    service = MemoryService(short_term, long_term, RecordingRetriever(None))
+    event = _episode_event(
+        "wrong-scenario",
+        "execution_snapshot_expired",
+        sim_time_s=300,
+    ).model_copy(update={"scenario_id": "scenario-2"})
+
+    assert service.ingest_tracking_events("operator", "scenario-1", (event,)) == ()
+    assert service.tracking_episodes("operator", "scenario-1") == []
+
+
+def test_tracking_handoff_episode_keeps_transfer_and_disappearance_sources(
+    tmp_path: Path,
+) -> None:
+    short_term = ShortTermContextRepository(tmp_path / "memory.db")
+    long_term = LongTermMemoryRepository(tmp_path / "memory.db")
+    service = MemoryService(short_term, long_term, RecordingRetriever(None))
+
+    episodes = service.ingest_tracking_events(
+        "operator",
+        "scenario-1",
+        (
+            _episode_event(
+                "passive-start",
+                "passive_track_started",
+                sim_time_s=100,
+                entity_id="group-incoming",
+                target_id="T1",
+                region_id="R2",
+            ),
+            _episode_event(
+                "transfer",
+                "tracking_ownership_transferred",
+                sim_time_s=120,
+                entity_id="group-incoming",
+                previous_owner_group_id="group-outgoing",
+                tracking_owner_group_id="group-incoming",
+            ),
+            _episode_event(
+                "disappeared",
+                "task_group_disappeared",
+                sim_time_s=130,
+                entity_id="group-outgoing",
+                replacement_group_instance_id="group-incoming",
+            ),
+        ),
+    )
+
+    handoff = [episode for episode in episodes if episode.kind == "tracking_handoff"]
+    assert len(handoff) == 1
+    assert handoff[0].source_event_ids == ("transfer", "disappeared")
 
 
 def test_prepare_context_filters_legacy_wrong_scenario_messages(tmp_path: Path) -> None:

@@ -42,9 +42,107 @@ export type PlanStatus =
   | "degraded";
 export type Concept =
   "quality_first" | "balanced" | "resource_saving" | "hold_current";
+
+/**
+ * Freshness is an explicit transport concern.  The UI never upgrades an
+ * unknown or legacy value to live; it only normalizes values already
+ * published by the backend.
+ */
+export type EstimateHealthStatus =
+  | "live"
+  | "current"
+  | "stale"
+  | "degraded"
+  | "expired"
+  | "unavailable"
+  | "failed"
+  | "unknown";
+
+export interface TargetEstimateFreshnessView {
+  status: EstimateHealthStatus;
+  estimate_time_s?: number | null;
+  valid_until_s?: number | null;
+  data_age_s?: number | null;
+  track_revision?: number | null;
+  source_observation_ids?: string[];
+  reason?: string | null;
+}
+
+/**
+ * Evidence-backed scan telemetry.  Every value is optional for old replay
+ * files, but the UI must not infer a value from route geometry or a trail.
+ */
+export interface ScanTelemetryView {
+  route_progress?: number | null;
+  scan_round?: number | null;
+  active_coverage_ratio?: number | null;
+  source_backed_ping_count?: number | null;
+  /** Alias accepted while the API rolls out the longer canonical name. */
+  active_ping_count?: number | null;
+  scan_completed?: boolean | null;
+  scan_completion_threshold?: number | null;
+  evidence_ids?: string[];
+}
+
+export type RegionEntryStatus =
+  | "pending"
+  | "confirmed"
+  | "blocked"
+  | "unavailable";
+
+export interface RegionEntryEvidenceView {
+  probability?: number | null;
+  confirmation_count?: number | null;
+  required_cycles?: number | null;
+  status?: RegionEntryStatus;
+  blocking_reasons?: string[];
+  evidence_ids?: string[];
+  source_track_revision?: number | null;
+  source_observation_ids?: string[];
+}
+
+export type HandoffEvidenceStatus =
+  | "pending"
+  | "ready"
+  | "completed"
+  | "blocked"
+  | "unavailable";
+
+export interface HandoffEvidenceView {
+  predecessor_group_id?: string | null;
+  successor_group_id?: string | null;
+  successor_region_id?: string | null;
+  observation_cycle_s?: number | null;
+  required_uuv_ids: string[];
+  valid_observation_uuv_ids: string[];
+  status: HandoffEvidenceStatus;
+  blocking_reasons?: string[];
+  evidence_ids?: string[];
+}
+
+export interface BlockingReasonView {
+  code: string;
+  message?: string | null;
+  scope?: string | null;
+  evidence_ids?: string[];
+}
 /** Read-only operating phase highlighted in the command-center sidebar. */
 export type OperationalStage =
   "task_execution" | "event_trigger" | "human_feedback" | "dynamic_adjustment";
+export type ExecutionRefreshStatus =
+  | "idle"
+  | "due"
+  | "generating"
+  | "committed"
+  | "waiting_for_source"
+  | "rejected"
+  | "recovering";
+export type ExecutionRefreshResult =
+  | "unknown"
+  | "committed"
+  | "rejected"
+  | "waiting_for_source"
+  | "recovered";
 
 export interface MapBounds {
   min_x: number;
@@ -147,7 +245,8 @@ export interface RegionTimelineView {
   status: "planned" | "active" | "handed_off" | "degraded" | "uncovered";
   coverage_mode: "required" | "reserve" | "optional";
   priority: number;
-  occupancy_likelihood: number;
+  /** Entry/occupancy probability is absent when the backend has no evidence. */
+  occupancy_likelihood: number | null;
   uuv_assignments: RegionAssignmentView[];
   communication_links: CommunicationLinkView[];
   handoff_from: string | null;
@@ -159,6 +258,7 @@ export interface RegionTimelineView {
   task_group_ids?: string[];
   slot_index?: number;
   geometry_revision?: number;
+  scan_telemetry?: ScanTelemetryView | null;
 }
 
 export interface BrainView {
@@ -235,6 +335,8 @@ export interface ExecutionRegionView {
   status: ExecutionRegionStatus;
   task_group_id: string | null;
   evidence_ids: string[];
+  /** Explicit per-region route/coverage telemetry; absent on legacy frames. */
+  scan_telemetry?: ScanTelemetryView | null;
 }
 
 export type TaskGroupLifecycle =
@@ -263,6 +365,9 @@ export interface TaskGroupInstanceView {
   source_group_instance_id?: string | null;
   reason: string;
   evidence_ids: string[];
+  /** Optional backend-confirmed deployment/observation evidence. */
+  deployed_member_uuv_ids?: string[];
+  passive_observation_uuv_ids?: string[];
 }
 
 export interface TrackingPolicyView {
@@ -294,6 +399,8 @@ export interface RegionReplacementView {
   outgoing_group_id: string;
   incoming_group_id: string;
   latest_pending_geometry_revision?: number | null;
+  /** Optional deployment/mission batch identity for audit UI. */
+  batch_id?: string | null;
 }
 
 export interface ExecutionView {
@@ -321,9 +428,25 @@ export interface ExecutionView {
   tracking_policy: TrackingPolicyView;
   tracking_control: TrackingControlView;
   replacements: RegionReplacementView[];
+  /** Region entry evidence and reset/block reasons, keyed by stable region ID. */
+  region_entry_probabilities?: Record<string, number | null>;
+  entry_confirmation_counts?: Record<string, number | null>;
+  entry_confirmation_required_cycles?: number | null;
+  entry_blocking_reasons?: Record<string, string[]>;
+  region_entry_evidence?: Record<string, RegionEntryEvidenceView>;
+  /** Current-cycle successor evidence. */
+  handoff_evidence?: HandoffEvidenceView | null;
+  blocking_reasons?: BlockingReasonView[];
   degraded: boolean;
   degradation_reasons: string[];
   active_plan_preserved: boolean;
+  refresh_status: ExecutionRefreshStatus;
+  refresh_attempt_id: string | null;
+  refresh_due_at_s: number | null;
+  refresh_last_attempt_s: number | null;
+  refresh_last_result: ExecutionRefreshResult;
+  refresh_reason_codes: string[];
+  refresh_source_snapshot_revision: number | null;
 }
 
 export interface FrameConsistencyReport {
@@ -427,6 +550,10 @@ export interface PredictionDiffView {
 export interface PredictionCorridorView {
   prediction_id: string;
   prediction_revision: number;
+  source_track_revision?: number | null;
+  last_observed_at_s?: number | null;
+  generated_at_s?: number | null;
+  valid_until_s?: number | null;
   origin_sim_time_s: number;
   health: PredictionHealthView;
   horizon_s: number;
@@ -459,7 +586,7 @@ export interface PredictionHealthView {
   status: PredictionHealthStatus;
   regime: PredictionHealthRegime;
   reason_codes: string[];
-  source_track_age_s: number;
+  source_track_age_s: number | null;
   clipped_point_fraction: number;
   maximum_radius_m: number;
   raw_prediction_id: string | null;
@@ -475,14 +602,30 @@ export interface WorldModelEvidenceView {
     | "tracking_context"
     | "uuv_projection"
     | "map_bounds"
-    | "observability";
+    | "observability"
+    | "short_history" | "boundary_recovery" | "task_region";
   value: number;
   threshold: number | null;
   unit: string;
   description: string;
 }
 
-export interface WorldModelEventView {
+export interface WorldModelProvenance {
+  source_track_revision?: number | null;
+  prediction_revision?: number | null;
+  generated_at_s?: number | null;
+  last_observed_at_s?: number | null;
+  valid_until_s?: number | null;
+  owner_group_id?: string | null;
+  region_id?: string | null;
+  region_geometry_revision?: number | null;
+  source_group_id?: string | null;
+  control_authority?: false;
+}
+
+export interface WorldModelEventView extends WorldModelProvenance {
+  source_prediction_id?: string | null;
+  source_plan_revision?: number | null;
   event_id: string;
   event_type: string;
   horizon: WorldModelHorizon;
@@ -504,7 +647,7 @@ export interface WorldModelHorizonView {
   covered: boolean;
 }
 
-export interface WorldModelForecastView {
+export interface WorldModelForecastView extends WorldModelProvenance {
   model_kind: "rule_demo";
   model_version: string;
   control_authority: false;
@@ -513,7 +656,7 @@ export interface WorldModelForecastView {
   source_observation_ids: string[];
   source_observability_event_ids: string[];
   source_plan_revision: number | null;
-  data_status: "ready" | "degraded";
+  data_status: "ready" | "degraded" | "expired" | "unavailable";
   trajectory_fallback_used: boolean;
   imm_model_probabilities: Record<string, number>;
   horizons: WorldModelHorizonView[];
@@ -522,18 +665,28 @@ export interface WorldModelForecastView {
 }
 
 export interface EstimateQualityView {
-  quality_score: number;
-  estimated_rmse_m: number;
-  fim_min_eigenvalue: number;
-  fim_condition: number;
+  quality_score: number | null;
+  estimated_rmse_m: number | null;
+  fim_min_eigenvalue: number | null;
+  fim_condition: number | null;
 }
 
 export interface TargetEstimateView {
   target_id: string;
   mean: Point2D;
-  covariance_ellipse: CovarianceEllipse;
+  covariance_ellipse: CovarianceEllipse | null;
+  estimate_health?: Record<string, unknown>;
   intent: IntentView;
   prediction: PredictionCorridorView | null;
+  /** Explicit estimator freshness contract; missing means unknown. */
+  estimate_freshness?: TargetEstimateFreshnessView | null;
+  /** Flat aliases used by incremental API publishers during migration. */
+  estimate_time_s?: number | null;
+  valid_until_s?: number | null;
+  data_age_s?: number | null;
+  track_revision?: number | null;
+  source_observation_ids?: string[];
+  estimate_health_status?: EstimateHealthStatus | null;
   world_model?: WorldModelForecastView | null;
   quality: EstimateQualityView;
   classification: "submarine" | "decoy" | "unknown";
@@ -576,10 +729,11 @@ export type TrackingEffectStatus =
 
 export interface TrackingEffectView {
   status: TrackingEffectStatus;
-  coverage_ratio: number;
-  quality_score: number;
-  handoff_progress: number;
-  quality_source: "group_quality_proxy" | "region_telemetry";
+  /** Legacy aggregate; null means the runtime did not publish this fact. */
+  coverage_ratio: number | null;
+  quality_score: number | null;
+  handoff_progress: number | null;
+  quality_source: "group_quality_proxy" | "region_telemetry" | "unavailable";
   hard_guard_reasons: string[];
   expert_feedback_ids: string[];
 }
@@ -619,6 +773,8 @@ export interface RegionTaskView {
   status: string;
   revision?: number;
   effect: TrackingEffectView;
+  scan_telemetry?: ScanTelemetryView | null;
+  handoff_evidence?: HandoffEvidenceView | null;
 }
 
 export interface RegionalPlanView {

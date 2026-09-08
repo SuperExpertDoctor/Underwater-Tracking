@@ -297,6 +297,9 @@ class OperationalFramePublisher:
         )
         active_plan = self._runtime.active_plan()
         execution_snapshot = _current_execution_snapshot(self._runtime)
+        world_model_reader = getattr(self._runtime, "world_model_forecasts_for_publication", None)
+        if callable(world_model_reader):
+            world_model_forecasts = world_model_reader(snapshot, execution_snapshot)
         authoritative_execution_health = _authoritative_execution_health(
             self._runtime,
             sim_time_s=snapshot.sim_time_s,

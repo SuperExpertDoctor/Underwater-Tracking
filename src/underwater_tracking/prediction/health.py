@@ -115,7 +115,10 @@ def assess_prediction(
     if confidence and isfinite(confidence[-1]) and confidence[-1] < config.minimum_point_confidence:
         reasons.add("confidence_below_floor")
 
-    raw_age = float(snapshot_sim_time_s - prediction.sim_time_s)
+    source_time = prediction.last_observed_at_s if prediction.last_observed_at_s is not None else prediction.sim_time_s
+    raw_age = float(snapshot_sim_time_s - source_time)
+    if prediction.valid_until_s is not None and snapshot_sim_time_s >= prediction.valid_until_s:
+        reasons.add("source_track_expired")
     if raw_age < 0.0:
         reasons.add("source_track_in_future")
     elif raw_age > config.hard_stale_s:

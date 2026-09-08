@@ -5,10 +5,13 @@ import type {
 } from "../../types/frames";
 import { MAP_DISPLAY_CONFIG } from "../../../configs/map_display";
 import { corridorPolygon } from "./geometry";
+import type { EstimatePresentationStatus } from "../../domain/operationalStatus";
+import { estimatePresentationStyle } from "../../domain/operationalStatus";
 
 interface PredictionOverlayEntry {
   targetId: string;
   prediction: PredictionCorridorView;
+  estimateStatus?: EstimatePresentationStatus;
 }
 
 interface PredictionOverlayProps {
@@ -148,10 +151,12 @@ export default function PredictionOverlay({
   height,
 }: PredictionOverlayProps) {
   const visible = predictions.filter(
-    ({ prediction }) => healthOf(prediction).status !== "unavailable",
+    ({ prediction, estimateStatus }) =>
+      healthOf(prediction).status !== "unavailable" && estimateStatus !== "unavailable",
   );
   const unavailable = predictions.filter(
-    ({ prediction }) => healthOf(prediction).status === "unavailable",
+    ({ prediction, estimateStatus }) =>
+      healthOf(prediction).status === "unavailable" || estimateStatus === "unavailable",
   );
   if (!visible.length && !unavailable.length) return null;
   return (
@@ -162,7 +167,7 @@ export default function PredictionOverlay({
       height={height}
       style={{ position: "absolute", inset: 0, pointerEvents: "none", overflow: "visible" }}
     >
-      {visible.map(({ targetId, prediction }) => {
+      {visible.map(({ targetId, prediction, estimateStatus }) => {
         const immCenterlineSource = displayImmCenterline(prediction);
         if (immCenterlineSource.length < 2) return null;
         const centerline = decimatePredictionPoints(immCenterlineSource.map(project));
@@ -174,12 +179,23 @@ export default function PredictionOverlay({
         const status = healthOf(prediction).status;
         const isDegraded = status === "degraded";
         const isLegacy = status === "legacy_unknown";
-        const bandStroke = isDegraded
+        const estimateStyle = estimateStatus ? estimatePresentationStyle(estimateStatus) : null;
+        const isExpiredEstimate = estimateStatus === "expired";
+        const isDimEstimate = estimateStatus != null && estimateStatus !== "live";
+        const bandStroke = isExpiredEstimate
+          ? estimateStyle?.stroke ?? "rgba(255, 183, 94, 0.86)"
+          : isDimEstimate
+            ? estimateStyle?.stroke ?? "rgba(173, 190, 205, 0.58)"
+            : isDegraded
           ? "rgba(247, 189, 69, 0.74)"
           : isLegacy
             ? "rgba(173, 190, 205, 0.58)"
             : "rgba(81, 216, 226, 0.68)";
-        const splineStroke = isDegraded
+        const splineStroke = isExpiredEstimate
+          ? estimateStyle?.stroke ?? "rgba(255, 183, 94, 0.92)"
+          : isDimEstimate
+            ? estimateStyle?.stroke ?? "rgba(173, 190, 205, 0.72)"
+            : isDegraded
           ? "rgba(255, 181, 71, 0.98)"
           : isLegacy
             ? "rgba(205, 214, 224, 0.82)"
@@ -189,8 +205,10 @@ export default function PredictionOverlay({
             key={targetId}
             data-target-id={targetId}
             data-health-status={status}
+            data-estimate-status={estimateStatus}
             data-prediction-id={prediction.prediction_id}
             data-prediction-revision={prediction.prediction_revision}
+            opacity={estimateStyle?.opacity ?? 1}
           >
             <defs>
               <pattern
@@ -215,10 +233,10 @@ export default function PredictionOverlay({
               data-prediction-source="imm"
               className={`imm-confidence-band prediction-health-${status}`}
               points={pointsAttribute(band)}
-              fill={isDegraded ? `url(#prediction-degraded-${targetId})` : isLegacy ? "rgba(173, 190, 205, 0.08)" : "rgba(52, 210, 224, 0.20)"}
+              fill={isExpiredEstimate ? estimateStyle?.fill : isDimEstimate ? estimateStyle?.fill : isDegraded ? `url(#prediction-degraded-${targetId})` : isLegacy ? "rgba(173, 190, 205, 0.08)" : "rgba(52, 210, 224, 0.20)"}
               stroke={bandStroke}
               strokeWidth="1.2"
-              strokeDasharray={isLegacy ? "3 5" : isDegraded ? "7 6" : undefined}
+              strokeDasharray={isExpiredEstimate ? "3 7" : isDimEstimate ? "5 6" : isLegacy ? "3 5" : isDegraded ? "7 6" : undefined}
             />
             <polyline
               className="bspline-prediction-centerline-shadow"
@@ -235,7 +253,7 @@ export default function PredictionOverlay({
               fill="none"
               stroke={splineStroke}
               strokeWidth="2.2"
-              strokeDasharray="8 6"
+              strokeDasharray={isExpiredEstimate ? "4 8" : "8 6"}
               strokeLinejoin="round"
               strokeLinecap="round"
             />
@@ -266,22 +284,23 @@ export default function PredictionOverlay({
               fontSize="9"
               fontWeight="700"
             >
-              {HEALTH_LABELS[status]}
+              {isExpiredEstimate ? "ESTIMATE EXPIRED" : estimateStatus === "stale" ? "ESTIMATE STALE" : HEALTH_LABELS[status]}
             </text>
           </g>
         );
       })}
-      {unavailable.map(({ targetId, prediction }) => (
+      {unavailable.map(({ targetId, prediction, estimateStatus }) => (
         <g
           key={`${targetId}:unavailable`}
           data-target-id={targetId}
           data-health-status="unavailable"
+          data-estimate-status={estimateStatus}
           data-prediction-id={prediction.prediction_id}
           data-prediction-revision={prediction.prediction_revision}
           className="prediction-unavailable"
         >
           <text className="prediction-health-status" x="12" y="20" fill="rgba(255, 120, 130, 0.92)" fontSize="9" fontWeight="700">
-            {`${targetId} ${HEALTH_LABELS[healthOf(prediction).status]}`}
+            {`${targetId} ${estimateStatus === "expired" ? "ESTIMATE EXPIRED" : estimateStatus === "unavailable" ? "ESTIMATE UNAVAILABLE" : HEALTH_LABELS[healthOf(prediction).status]}`}
           </text>
         </g>
       ))}

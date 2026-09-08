@@ -36,6 +36,11 @@ class MemoryType(StrEnum):
     PROCEDURAL = "procedural"
 
 
+class MemoryEpisodeStatus(StrEnum):
+    OPEN = "open"
+    CLOSED = "closed"
+
+
 class MemoryStatus(StrEnum):
     ACTIVE = "active"
     SUPERSEDED = "superseded"
@@ -189,6 +194,72 @@ class MemoryVersion(_MemoryModel):
         if self.version > 1 and self.supersedes_memory_id is None:
             raise ValueError("version greater than 1 requires supersedes_memory_id")
         return self
+
+
+class MemoryEpisode(_MemoryModel):
+    """A deterministic, source-backed tracking episode."""
+
+    episode_id: _Identifier
+    user_id: UserId = "operator"
+    scenario_id: _Identifier
+    kind: _Identifier
+    entity_id: _Identifier
+    opening_execution_revision: int = Field(default=0, ge=0)
+    status: MemoryEpisodeStatus = MemoryEpisodeStatus.OPEN
+    summary: _MemorySummary
+    source_event_ids: tuple[_Identifier, ...] = Field(default=(), max_length=128)
+    source_message_ids: tuple[_Identifier, ...] = Field(default=(), max_length=128)
+    source_decision_ids: tuple[_Identifier, ...] = Field(default=(), max_length=128)
+    source_plan_ids: tuple[_Identifier, ...] = Field(default=(), max_length=128)
+    started_sim_time_s: int = Field(ge=0)
+    ended_sim_time_s: int | None = Field(default=None, ge=0)
+    closing_execution_revision: int | None = Field(default=None, ge=0)
+    frame_id: int | None = Field(default=None, ge=0)
+    episode_key: tuple[str, str, str, int] | None = None
+    created_at: datetime = Field(default_factory=_utc_now)
+    updated_at: datetime = Field(default_factory=_utc_now)
+
+    @model_validator(mode="before")
+    @classmethod
+    def populate_episode_key(cls, value: object) -> object:
+        if not isinstance(value, dict) or value.get("episode_key") is not None:
+            return value
+        scenario_id = value.get("scenario_id")
+        kind = value.get("kind")
+        entity_id = value.get("entity_id")
+        opening_revision = value.get("opening_execution_revision", 0)
+        if (
+            isinstance(scenario_id, str)
+            and isinstance(kind, str)
+            and isinstance(entity_id, str)
+            and isinstance(opening_revision, int)
+            and not isinstance(opening_revision, bool)
+        ):
+            populated = dict(value)
+            populated["episode_key"] = (
+                scenario_id,
+                kind,
+                entity_id,
+                opening_revision,
+            )
+            return populated
+        return value
+
+    @model_validator(mode="after")
+    def validate_episode_key(self) -> "MemoryEpisode":
+        expected = (
+            self.scenario_id,
+            self.kind,
+            self.entity_id,
+            self.opening_execution_revision,
+        )
+        if self.episode_key is not None and self.episode_key != expected:
+            raise ValueError("episode_key must match episode identity and opening revision")
+        return self
+
+    @property
+    def episode_type(self) -> str:
+        return self.kind
 
 
 class MemoryRetrievalHit(StrictModel):

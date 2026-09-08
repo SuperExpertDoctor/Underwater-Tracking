@@ -11,6 +11,7 @@ from underwater_tracking.runtime.execution_coordinator import ExecutionCoordinat
 from underwater_tracking.runtime.mission_controller import MissionController
 from tests.runtime.test_mission_controller import _runtime_execution_snapshot
 from tests.runtime.test_mission_controller import _runtime_replacement_snapshot
+from underwater_tracking.domain.execution_models import ExecutionSemanticAdvice
 
 
 def _snapshot(**updates: object):
@@ -65,11 +66,13 @@ def test_startup_revision_one_is_immediately_readable_and_executable() -> None:
 
 def test_rolling_check_is_due_every_450_simulation_seconds() -> None:
     coordinator = ExecutionCoordinator(snapshot=_snapshot())
+    valid_from_s = int(coordinator.current.valid_from_s)
 
-    assert coordinator.rolling_check_due(120)
-    coordinator.mark_rolling_check(120)
-    assert not coordinator.rolling_check_due(569)
-    assert coordinator.rolling_check_due(570)
+    assert not coordinator.rolling_check_due(valid_from_s + 449)
+    assert coordinator.rolling_check_due(valid_from_s + 450)
+    coordinator.mark_rolling_check(valid_from_s + 450)
+    assert not coordinator.rolling_check_due(valid_from_s + 899)
+    assert coordinator.rolling_check_due(valid_from_s + 900)
 
 
 def test_prediction_leaving_the_active_chain_requests_immediate_replan() -> None:
@@ -476,6 +479,89 @@ def test_semantic_optimization_cannot_change_physical_execution_fields() -> None
     assert coordinator.current == baseline
 
 
+def test_semantic_advice_is_revision_bound_and_can_commit_without_physical_changes() -> None:
+    baseline = _snapshot(execution_revision=1, base_execution_revision=None)
+    coordinator = ExecutionCoordinator(snapshot=baseline)
+    advice = ExecutionSemanticAdvice(
+        situation_revision=baseline.source_snapshot_revision,
+        base_execution_revision=baseline.execution_revision,
+        prediction_revision=baseline.prediction_revision,
+        strategy_explanation="hold the current evidence-backed priority",
+        priority=0.8,
+        timing_preference="balanced",
+        tracking_mode_suggestion="passive_track",
+        rationale="the current public estimate remains usable",
+        evidence_ids=baseline.evidence_ids[:1],
+    )
+    candidate = _candidate(
+        baseline,
+        execution_revision=2,
+        base_execution_revision=1,
+        plan_source="llm_optimized",
+        semantic_advice=advice,
+    )
+
+    result = coordinator.commit_semantic_optimization(
+        candidate,
+        base_execution_revision=1,
+    )
+
+    assert result.committed is True
+    assert result.snapshot is not None
+    assert result.snapshot.semantic_advice == advice
+
+
+def test_semantic_advice_with_stale_prediction_revision_is_rejected() -> None:
+    baseline = _snapshot(execution_revision=1, base_execution_revision=None)
+    coordinator = ExecutionCoordinator(snapshot=baseline)
+    advice = ExecutionSemanticAdvice(
+        situation_revision=baseline.source_snapshot_revision,
+        base_execution_revision=baseline.execution_revision,
+        prediction_revision=baseline.prediction_revision + 1,
+        strategy_explanation="use a later estimate",
+        priority=0.5,
+        timing_preference="earliest_feasible",
+        tracking_mode_suggestion="active_scan",
+        rationale="stale advice must not be applied",
+        evidence_ids=baseline.evidence_ids[:1],
+    )
+    candidate = _candidate(
+        baseline,
+        execution_revision=2,
+        base_execution_revision=1,
+        plan_source="llm_optimized",
+        semantic_advice=advice,
+    )
+
+    result = coordinator.commit_semantic_optimization(
+        candidate,
+        base_execution_revision=1,
+    )
+
+    assert result.status == "rejected"
+    assert result.reason == "semantic_advice_revision_mismatch"
+
+
+def test_semantic_optimization_cannot_change_tracking_control() -> None:
+    baseline = _snapshot(execution_revision=1, base_execution_revision=None)
+    coordinator = ExecutionCoordinator(snapshot=baseline)
+    candidate = _candidate(
+        baseline,
+        execution_revision=2,
+        base_execution_revision=1,
+        plan_source="llm_optimized",
+        tracking_control=baseline.tracking_control.model_copy(update={"mode": "dedicated"}),
+    )
+
+    result = coordinator.commit_semantic_optimization(
+        candidate,
+        base_execution_revision=1,
+    )
+
+    assert result.status == "rejected"
+    assert result.reason == "semantic_optimization_changed_physical_fields"
+
+
 def test_terminal_failure_rejects_delayed_semantic_result_without_side_effects() -> None:
     baseline = _snapshot(execution_revision=1, base_execution_revision=None)
     coordinator = ExecutionCoordinator(snapshot=baseline)
@@ -527,6 +613,27 @@ def test_failed_health_preserves_audit_read_but_blocks_execution() -> None:
     assert coordinator.active_mission_plan() == baseline
     assert not coordinator.is_executable(sim_time_s=100, hard_stale_s=900)
     assert coordinator.executable_mission_plan(sim_time_s=100, hard_stale_s=900) is None
+
+
+def test_valid_higher_revision_recovers_after_candidate_scoped_failure() -> None:
+    baseline = _snapshot(execution_revision=1, base_execution_revision=None)
+    coordinator = ExecutionCoordinator(snapshot=baseline)
+    coordinator.mark_failed("execution_snapshot_not_executable")
+    replacement = _candidate(
+        baseline,
+        execution_revision=2,
+        base_execution_revision=1,
+        valid_from_s=100.0,
+        valid_until_s=550.0,
+    )
+
+    result = coordinator.commit(replacement)
+
+    assert result.committed
+    assert coordinator.current == replacement
+    health = coordinator.execution_health(sim_time_s=100, hard_stale_s=900)
+    assert health.executable
+    assert "execution_snapshot_not_executable" not in health.reason_codes
 
 
 def test_missing_snapshot_health_blocks_executable_read() -> None:

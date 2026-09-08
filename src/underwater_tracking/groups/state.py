@@ -117,6 +117,10 @@ class GroupState(StrictModel):
     #: until the first acceptance. Predict-only cycles never overwrite it,
     #: so quality can age the track across stale periods (freshness decay).
     last_accepted_sim_time_s: int | None = None
+    processed_observation_ids: tuple[str, ...] = ()
+    bootstrap_observation_ids: tuple[str, ...] = ()
+    observation_rejection_reasons: tuple[str, ...] = ()
+    observation_validity_s: int = Field(default=900, gt=0)
 
     @classmethod
     def initial(
