@@ -105,6 +105,7 @@ _RUNTIME_GROUP_TRANSITION_EVENTS = frozenset(
         "task_group_disappeared",
         "region_replacement_started",
         "region_replacement_completed",
+        "region_replacement_geometry_coalesced",
         "dedicated_tracking_started",
         "dedicated_release_threshold_reached",
         "regional_mode_restored",

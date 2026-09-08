@@ -70,7 +70,7 @@ def build_four_region_baseline(
     if prediction.target_id != target_id:
         raise ValueError("accepted prediction target does not match baseline target")
 
-    points = tuple((float(x), float(y)) for x, y in prediction.points_xy)
+    times, points, radii = _trajectory_components(prediction)
     if not points:
         return _reproject_previous(
             prior_regions,
@@ -81,7 +81,6 @@ def build_four_region_baseline(
             reason_codes=(*accepted.health.reason_codes, "accepted_prediction_has_no_geometry"),
             prediction_point_count=prior_prediction_point_count,
         )
-    times = tuple(float(value) for value in prediction.times_s)
     requested_end_s = origin_sim_time_s + WINDOW_OFFSETS_S[-1][1]
     if (
         len(times) != len(points)
@@ -93,7 +92,6 @@ def build_four_region_baseline(
             origin_sim_time_s + index * prediction.sample_step_s
             for index in range(len(points))
         )
-    radii = tuple(float(value) for value in prediction.corridor_radius_m)
     if len(radii) != len(points):
         radii = (0.0,) * len(points)
 
@@ -159,6 +157,44 @@ def _window_center(samples: Sequence[tuple[float, float, float]]) -> tuple[float
         sum(x for x, _, _ in samples) / count,
         sum(y for _, y, _ in samples) / count,
     )
+
+
+def _trajectory_components(
+    prediction: object,
+) -> tuple[
+    tuple[float, ...],
+    tuple[tuple[float, float], ...],
+    tuple[float, ...],
+]:
+    """Select the trajectory used by the executable IMM contract.
+
+    Short-history predictions may retain a stationary fallback in the legacy
+    ``points_xy`` fields while carrying a usable dynamic IMM forecast in the
+    attached component fields.  Region geometry must follow the same forecast
+    as the execution snapshot; malformed or incomplete IMM components fall
+    back to the base prediction for replay compatibility.
+    """
+    raw_times = tuple(float(value) for value in getattr(prediction, "times_s", ()))
+    raw_points = tuple(
+        (float(point[0]), float(point[1]))
+        for point in getattr(prediction, "points_xy", ())
+    )
+    raw_radii = tuple(
+        float(value) for value in getattr(prediction, "corridor_radius_m", ())
+    )
+    imm_times = tuple(
+        float(value) for value in getattr(prediction, "imm_times_s", ())
+    )
+    imm_points = tuple(
+        (float(point[0]), float(point[1]))
+        for point in getattr(prediction, "imm_centerline_xy", ())
+    )
+    imm_radii = tuple(
+        float(value) for value in getattr(prediction, "imm_corridor_radius_m", ())
+    )
+    if imm_times and len(imm_times) == len(imm_points):
+        return imm_times, imm_points, imm_radii
+    return raw_times, raw_points, raw_radii
 
 
 def _clamped_square_center(

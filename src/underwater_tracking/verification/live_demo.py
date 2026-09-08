@@ -685,9 +685,13 @@ def _diagnostic_error_violations(
     planning = frame.get("planning")
     if isinstance(planning, Mapping):
         planning_error = planning.get("last_error")
-        if isinstance(planning_error, str) and planning_error.strip():
+        if (
+            isinstance(planning_error, str)
+            and planning_error.strip()
+            and _planning_failure_is_terminal(planning)
+        ):
             violations.append("planning_exception_present")
-        if str(planning.get("status", "")).lower() in {"failed", "rejected"}:
+        elif str(planning.get("status", "")).lower() in {"failed", "rejected"}:
             violations.append("planning_exception_present")
 
     frozen_without_zero_speed = False

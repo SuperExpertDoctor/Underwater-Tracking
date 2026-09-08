@@ -7,7 +7,12 @@ from tests.public_contract_fixtures import prior_bearing
 
 from underwater_tracking.config.loader import load_app_config
 from underwater_tracking.domain.agent_models import PlanCommand, Waypoint
-from underwater_tracking.domain.models import DeploymentState
+from underwater_tracking.domain.models import (
+    DeploymentState,
+    GroupQuality,
+    GroupReport,
+    TargetBelief,
+)
 from underwater_tracking.domain.observations import PassiveSonarObservation
 from underwater_tracking.domain.execution_models import (
     GroupSensorMode,
@@ -15,6 +20,7 @@ from underwater_tracking.domain.execution_models import (
     TaskGroupLifecycle,
     TrackingControlState,
 )
+from underwater_tracking.domain.mission_models import RegionLifecycle, RegionMissionState
 from underwater_tracking.config.models import TrackingPolicyConfig
 from underwater_tracking.runtime.mission_controller import MissionController
 from underwater_tracking.runtime.mission_controller import (
@@ -62,6 +68,85 @@ def _runtime_execution_snapshot():
             "tracking_control": TrackingControlState(mode="regional"),
         },
     )
+
+
+def test_runtime_passive_routes_are_scoped_to_each_execution_region() -> None:
+    engine = SimulationEngine(load_app_config(CONFIG_PATH), seed=42)
+    base = _runtime_execution_snapshot()
+    groups = tuple(
+        group.model_copy(
+            update={
+                "lifecycle": TaskGroupLifecycle.PASSIVE_TRACK,
+                "sensor_mode": GroupSensorMode.PASSIVE,
+            }
+        )
+        for group in base.task_groups[:2]
+    )
+    report = GroupReport(
+        group_id="target_00:execution:owner",
+        target_id="target_00",
+        sim_time_s=120,
+        member_ids=groups[0].member_uuv_ids,
+        belief=TargetBelief(
+            target_id="target_00",
+            sim_time_s=120,
+            mean=(-5_000.0, -5_000.0, 0.0, 0.0, 0.0),
+            covariance=tuple(
+                tuple(100.0 if row == column else 0.0 for column in range(5))
+                for row in range(5)
+            ),
+            model_probabilities={"CV": 1.0},
+            source_observation_ids=("passive:target_00:120",),
+            track_revision=3,
+        ),
+        quality=GroupQuality(
+            instant=1.0,
+            window_mean=1.0,
+            ewma=1.0,
+            components={"bearing": 1.0},
+        ),
+        plan_revision=1,
+    )
+    for group in groups:
+        for index, member_id in enumerate(group.member_uuv_ids):
+            engine._uuvs[member_id].position_xy = (800.0, (index - 1) * 350.0)
+
+    def region_for(
+        group: TaskGroupInstance,
+        x_min: float,
+        x_max: float,
+    ) -> RegionMissionState:
+        return RegionMissionState(
+            region_id=group.region_id,
+            target_id=group.target_id,
+            task_group_id=group.group_instance_id,
+            lifecycle=RegionLifecycle.PASSIVE_TRACK,
+            passive_track_uuv_ids=group.member_uuv_ids,
+            tracking_quality=1.0,
+            region_polygon=(
+                (x_min, -1_000.0),
+                (x_max, -1_000.0),
+                (x_max, 1_000.0),
+                (x_min, 1_000.0),
+            ),
+        )
+
+    first_region = region_for(groups[0], -1_000.0, 1_000.0)
+    second_region = region_for(groups[1], 900.0, 2_900.0)
+    first_routes = engine._plan_runtime_passive_routes(
+        groups[0], groups[0].member_uuv_ids, report, region=first_region
+    )
+    second_routes = engine._plan_runtime_passive_routes(
+        groups[1], groups[1].member_uuv_ids, report, region=second_region
+    )
+
+    assert first_routes
+    assert second_routes
+    assert all(-1_000.0 <= point[0] <= 1_000.0 for route in first_routes.values() for point in route)
+    assert all(900.0 <= point[0] <= 2_900.0 for route in second_routes.values() for point in route)
+    assert min(
+        point[0] for route in second_routes.values() for point in route
+    ) > min(point[0] for route in first_routes.values() for point in route)
 
 
 def test_uuv_only_initialization_has_public_prior_but_no_execution_group() -> None:

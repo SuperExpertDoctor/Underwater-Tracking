@@ -131,8 +131,8 @@ const STAGES: StageExpectation[] = [
     visibleUuvCount: 24,
     activeScanGroups: 0,
     passiveTrackGroups: 1,
-    enteringGroups: 3,
-    exitingGroups: 4,
+    enteringGroups: 7,
+    exitingGroups: 0,
   },
 ];
 

@@ -237,6 +237,24 @@ def test_strict_live_checkpoint_validator_accepts_a_bounded_usable_frame() -> No
     assert violations == ()
 
 
+def test_checkpoint_validator_allows_retryable_plan_invalidation() -> None:
+    frame = _strict_live_checkpoint_frame()
+    frame["planning"] = {
+        "status": "running",
+        "last_result_status": "invalidated",
+        "last_error": "active_plan_advanced",
+        "queued_event_count": 1,
+        "retry_not_before_utc_ms": 1_000,
+        "dead_letter_event_ids": [],
+    }
+
+    assert live_demo.validate_live_checkpoint_frame(
+        frame,
+        prediction_radius_cap_m=5,
+        execution_max_age_s=900,
+    ) == ()
+
+
 @pytest.mark.parametrize(
     ("change", "expected"),
     [

@@ -803,7 +803,9 @@ def _wait_for_checkpoint_frame(
     deadline: float,
     *,
     previous_frame_id: int | None,
+    frame_log: Path | None = None,
 ) -> dict[str, object]:
+    """Wait for a live frame that is also durable in the replay log."""
     last_frame: dict[str, object] = {}
     while time.monotonic() < deadline:
         if process.poll() is not None:
@@ -828,7 +830,8 @@ def _wait_for_checkpoint_frame(
                 and not isinstance(frame_id, bool)
                 and (previous_frame_id is None or frame_id > previous_frame_id)
             ):
-                return frame
+                if frame_log is None or _frame_from_jsonl(frame_log, frame_id) is not None:
+                    return frame
         time.sleep(_POLL_INTERVAL_S)
     raise _AcceptanceFailure(
         f"checkpoint {checkpoint_s} timed out; latest_frame={last_frame.get('frame_id')!r}; "
@@ -2581,6 +2584,7 @@ def run_live_acceptance(
                     checkpoint_s,
                     global_deadline,
                     previous_frame_id=previous_frame_id,
+                    frame_log=frame_log,
                 )
                 current_frame = frame
                 observation = _checkpoint_metric_observation(

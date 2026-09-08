@@ -8178,6 +8178,7 @@ class SimulationEngine:
                 group,
                 deployed_members,
                 report,
+                region=region,
             )
             if passive_routes:
                 for member_id, route in passive_routes.items():
@@ -8234,13 +8235,26 @@ class SimulationEngine:
         group: TaskGroupInstance,
         members: tuple[str, ...],
         report: GroupReport | None,
+        *,
+        region: RegionMissionState,
     ) -> dict[str, tuple[tuple[float, float], ...]]:
-        """Plan separated passive standoff points from the fused public belief."""
+        """Plan separated passive standoff points inside one execution region.
+
+        The fused report is shared by all task groups for a target, but the
+        physical route is not.  A group whose region does not contain the
+        current estimate must patrol its own forecast corridor rather than
+        chase the same global sigma-point lattice as every other group.
+        """
         if (
             report is None
             or len(report.belief.mean) < 2
             or not report.belief.source_observation_ids
         ):
+            return {}
+        polygon = tuple(
+            (float(point[0]), float(point[1])) for point in region.region_polygon
+        )
+        if len(polygon) < 3:
             return {}
         active_ranges = tuple(
             self._uuvs[member_id].capability.passive_range_m
@@ -8250,17 +8264,41 @@ class SimulationEngine:
             return {}
         try:
             sigma_points = self._belief_sigma_points_xy(report.belief)
+            belief_mean = (
+                float(report.belief.mean[0]),
+                float(report.belief.mean[1]),
+            )
+            focus = (
+                belief_mean
+                if _point_in_polygon(belief_mean, polygon)
+                else self._region_center(region)
+            )
+            sigma_center = sigma_points.mean(axis=0)
+            regional_sigma_points = np.asarray(
+                [
+                    _project_point_to_polygon(
+                        (
+                            float(focus[0] + point[0] - sigma_center[0]),
+                            float(focus[1] + point[1] - sigma_center[1]),
+                        ),
+                        polygon,
+                    )
+                    for point in sigma_points
+                ],
+                dtype=float,
+            )
             bounds = (
-                self._config.environment.map_bounds_xy
-                if self._config.environment is not None
-                else (-12000.0, 12000.0, -12000.0, 12000.0)
+                min(point[0] for point in polygon),
+                max(point[0] for point in polygon),
+                min(point[1] for point in polygon),
+                max(point[1] for point in polygon),
             )
             plan = plan_group_waypoints(
                 np.asarray(
                     [self._uuvs[member_id].position_xy for member_id in members],
                     dtype=float,
                 ),
-                sigma_points,
+                regional_sigma_points,
                 previous_waypoints=None,
                 max_step_m=_WAYPOINT_MAX_STEP_M,
                 min_separation_m=_WAYPOINT_MIN_SEPARATION_M,
@@ -8274,6 +8312,14 @@ class SimulationEngine:
         except (ValueError, np.linalg.LinAlgError):
             return {}
         if plan.separation_violated:
+            return {}
+        if any(
+            not _point_in_polygon(
+                (float(point[0]), float(point[1])),
+                polygon,
+            )
+            for point in plan.waypoints_xy
+        ):
             return {}
         return {
             member_id: (

@@ -7,6 +7,7 @@ import pytest
 from underwater_tracking.domain.event_registry import (
     EVENT_REGISTRY,
     PRIVATE_AUDIENCES,
+    PUBLIC_AUDIENCES,
     event_definition,
 )
 
@@ -29,3 +30,10 @@ def test_boundary_recovery_events_are_registered_as_private_nonplanning_events()
     assert "target_navigation_guard_failed" not in EVENT_REGISTRY
     with pytest.raises(ValueError, match="unknown event type"):
         event_definition("target_navigation_guard_failed")
+
+
+def test_coalesced_region_replacement_event_is_registered() -> None:
+    definition = event_definition("region_replacement_geometry_coalesced")
+
+    assert definition.audiences == PUBLIC_AUDIENCES
+    assert definition.plan_impact_policy == "never"

@@ -21,6 +21,9 @@ from underwater_tracking.domain.mission_models import (
 from underwater_tracking.runtime.mission_controller import MissionController
 from underwater_tracking.simulation.engine import SimulationEngine
 from underwater_tracking.verification.live_demo import validate_uuv_only_frame
+from underwater_tracking.verification.three_uuv_tracking_fixture import (
+    ThreeUuvTrackingModesFixture,
+)
 from underwater_tracking.verification.uuv_tracking_coverage_runner import NoNetworkLLM
 
 
@@ -245,6 +248,67 @@ def _mission_event_types(payloads: list[dict[str, object]]) -> tuple[str, ...]:
                 seen.add(event_id)
                 result.append(event_type)
     return tuple(result)
+
+
+def test_http_acceptance_fixture_transfers_owner_with_one_exiting_group(
+    tmp_path: Path,
+) -> None:
+    harness = _RuntimeAcceptanceHarness(tmp_path)
+    try:
+        fixture = ThreeUuvTrackingModesFixture(
+            engine=harness.engine,
+            loop=harness.loop,
+            controller=harness.controller,
+        )
+        fixture.advance("active_scan")
+        fixture.advance("passive_track")
+        frame = fixture.advance("regional_handoff")
+
+        execution = frame["execution"]
+        assert isinstance(execution, dict)
+        groups = execution["task_groups"]
+        assert isinstance(groups, list)
+        assert sum(group["lifecycle"] == "passive_track" for group in groups) == 1
+        assert sum(group["lifecycle"] == "exiting" for group in groups) == 1
+        owner_id = execution["tracking_control"]["tracking_owner_group_id"]
+        assert owner_id == next(
+            group["group_instance_id"]
+            for group in groups
+            if group["lifecycle"] == "passive_track"
+        )
+    finally:
+        harness.close()
+
+
+def test_http_acceptance_fixture_restores_regional_mode_with_handoff_evidence(
+    tmp_path: Path,
+) -> None:
+    harness = _RuntimeAcceptanceHarness(tmp_path)
+    try:
+        fixture = ThreeUuvTrackingModesFixture(
+            engine=harness.engine,
+            loop=harness.loop,
+            controller=harness.controller,
+        )
+        for stage in (
+            "active_scan",
+            "passive_track",
+            "regional_handoff",
+            "dedicated_track",
+            "dedicated_steady",
+            "dedicated_restore_pending",
+        ):
+            fixture.advance(stage)
+        frame = fixture.advance("regional_restore")
+
+        execution = frame["execution"]
+        assert isinstance(execution, dict)
+        assert execution["tracking_control"]["mode"] == "regional"
+        groups = execution["task_groups"]
+        assert isinstance(groups, list)
+        assert sum(group["lifecycle"] == "passive_track" for group in groups) == 1
+    finally:
+        harness.close()
 
 
 def _ordered_subsequence(

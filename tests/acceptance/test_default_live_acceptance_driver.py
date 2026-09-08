@@ -5,8 +5,37 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 from tools import run_default_live_acceptance as driver
+
+
+def test_checkpoint_wait_skips_unpersisted_live_frame(tmp_path: Path, monkeypatch) -> None:
+    replay = tmp_path / "operational_frames.jsonl"
+    replay.write_text(
+        '{"frame_id": 4, "sim_time_s": 630, "plan_version": 1}\n',
+        encoding="utf-8",
+    )
+    snapshots = iter(
+        (
+            (200, {"frame_id": 3, "sim_time_s": 605}),
+            (200, {"frame_id": 4, "sim_time_s": 630}),
+        )
+    )
+    monkeypatch.setattr(driver, "_request_json", lambda *_args, **_kwargs: next(snapshots))
+    monkeypatch.setattr(driver, "_POLL_INTERVAL_S", 0.0)
+
+    frame = driver._wait_for_checkpoint_frame(
+        SimpleNamespace(),
+        SimpleNamespace(poll=lambda: None),
+        600,
+        driver.time.monotonic() + 1.0,
+        previous_frame_id=None,
+        frame_log=replay,
+    )
+
+    assert frame["frame_id"] == 4
+    assert frame["sim_time_s"] == 630
 
 
 def _fixture_server(tmp_path: Path) -> Path:

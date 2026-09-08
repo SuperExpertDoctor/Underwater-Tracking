@@ -40,6 +40,7 @@ def test_legacy_frame_defaults_refresh_projection_to_idle_unknown() -> None:
     assert frame.execution.refresh_last_result == "unknown"
     assert frame.execution.refresh_due_at_s is None
     assert frame.execution.refresh_last_attempt_s is None
+    assert frame.execution.refresh_attempt_id is None
     assert frame.execution.refresh_source_snapshot_revision is None
 
 

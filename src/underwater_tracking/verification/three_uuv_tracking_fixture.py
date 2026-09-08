@@ -12,6 +12,10 @@ from underwater_tracking.domain.execution_models import (
     TaskGroupLifecycle,
     TrackingControlState,
 )
+from underwater_tracking.domain.mission_models import (
+    AcceptedHandoffObservation,
+    HandoffEvidence,
+)
 from underwater_tracking.runtime.mission_controller import MissionController
 from underwater_tracking.verification.live_demo import validate_uuv_only_frame
 
@@ -97,6 +101,7 @@ class ThreeUuvTrackingModesFixture:
                 {"entry_probability": {self._region_ids[0]: 0.95}},
             )
         elif stage == "regional_handoff":
+            predecessor = self._group_by_id(self._tracking_owner_id())
             successor = self._group_for_region(self._region_ids[1])
             self._publish_observation(
                 40,
@@ -109,8 +114,12 @@ class ThreeUuvTrackingModesFixture:
                     "deployed_uuv_ids": {
                         successor.group_instance_id: successor.member_uuv_ids
                     },
-                    "passive_observer_ids": {
-                        successor.group_instance_id: successor.member_uuv_ids
+                    "handoff_evidence": {
+                        predecessor.region_id: self._handoff_evidence(
+                            predecessor,
+                            successor,
+                            sim_time_s=50,
+                        )
                     },
                 },
             )
@@ -151,6 +160,9 @@ class ThreeUuvTrackingModesFixture:
                 },
             )
         elif stage == "regional_restore":
+            predecessor = self._dedicated_owner
+            if predecessor is None:
+                raise RuntimeError("dedicated acceptance owner is unavailable")
             pending_id = self._pending_successor_id()
             pending = self._group_by_id(pending_id)
             frame = self._publish_observation(
@@ -159,8 +171,12 @@ class ThreeUuvTrackingModesFixture:
                     "deployed_uuv_ids": {
                         pending.group_instance_id: pending.member_uuv_ids
                     },
-                    "passive_observer_ids": {
-                        pending.group_instance_id: pending.member_uuv_ids
+                    "handoff_evidence": {
+                        predecessor.region_id: self._handoff_evidence(
+                            predecessor,
+                            pending,
+                            sim_time_s=80,
+                        )
                     },
                 },
             )
@@ -227,6 +243,32 @@ class ThreeUuvTrackingModesFixture:
         if not isinstance(successor_id, str) or not successor_id:
             raise RuntimeError("three-UUV fixture has no pending successor")
         return successor_id
+
+    def _handoff_evidence(
+        self,
+        predecessor: TaskGroupInstance,
+        successor: TaskGroupInstance,
+        *,
+        sim_time_s: int,
+    ) -> HandoffEvidence:
+        return HandoffEvidence(
+            predecessor_region_id=predecessor.region_id,
+            successor_region_id=successor.region_id,
+            plan_revision=self._controller.snapshot().plan_revision,
+            observation_cycle_s=sim_time_s,
+            required_uuv_ids=successor.member_uuv_ids,
+            deployed_uuv_ids=successor.member_uuv_ids,
+            healthy_uuv_ids=successor.member_uuv_ids,
+            passive_mode_uuv_ids=successor.member_uuv_ids,
+            accepted_observations=tuple(
+                AcceptedHandoffObservation(
+                    observation_id=f"passive:{member_id}:{sim_time_s}",
+                    observer_uuv_id=member_id,
+                    observed_at_s=sim_time_s,
+                )
+                for member_id in successor.member_uuv_ids
+            ),
+        )
 
     def _complete_group_exit(self, group: TaskGroupInstance, *, sim_time_s: int) -> None:
         for member_id in group.member_uuv_ids:

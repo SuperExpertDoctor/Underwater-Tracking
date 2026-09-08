@@ -290,6 +290,36 @@ def test_fixed_square_baseline_clamps_center_without_shrinking() -> None:
     assert all(region.side_length_m == 2_000.0 for region in baseline.regions)
 
 
+def test_baseline_uses_attached_imm_trajectory_for_dynamic_regions() -> None:
+    accepted = _accepted(
+        regime="short_history",
+        points=tuple((2_000.0, 2_000.0) for _ in range(19)),
+        radii=(0.0,) * 19,
+    )
+    assert accepted.prediction is not None
+    imm_points = tuple((2_000.0 + index * 300.0, 2_000.0) for index in range(19))
+    prediction = accepted.prediction.model_copy(
+        update={
+            "imm_times_s": accepted.prediction.times_s,
+            "imm_centerline_xy": imm_points,
+            "imm_corridor_radius_m": (0.0,) * len(imm_points),
+        }
+    )
+    accepted = accepted.model_copy(update={"prediction": prediction})
+
+    baseline = build_four_region_baseline(
+        accepted,
+        target_id="T1",
+        execution_revision=7,
+        origin_sim_time_s=1_000.0,
+        map_bounds_xy=MAP_BOUNDS,
+    )
+
+    centers = tuple(region.center[0] for region in baseline.regions)
+    assert centers == tuple(sorted(centers))
+    assert len(set(centers)) == 4
+
+
 def test_fixed_square_baseline_rejects_map_that_cannot_fit_full_square() -> None:
     with pytest.raises(ValueError, match="cannot fit a full square"):
         build_four_region_baseline(
